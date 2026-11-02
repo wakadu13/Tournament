@@ -27,6 +27,14 @@ on:
 permissions:
   contents: write
 
+# Deux pushes rapproches lancent deux runs qui publient tous les deux la
+# release « latest ». Sans garde-fou, le plus ancien peut terminer en
+# DERNIER et ecraser la release avec des binaires perimes. On annule donc
+# le run precedent de la meme branche des qu'un nouveau demarre.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   RAYLIB_TAG: "5.5"
 
