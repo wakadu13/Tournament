@@ -540,22 +540,31 @@ static void UpdateLocalPlayer(float dt)
     PlayerInput in = {0};
 
     // --- Souris : rotation de la vue (moins sensible en visant) ---
+    // ATTENTION : sur mobile, raylib fait passer le tactile POUR la souris.
+    // Lire la souris ici ajouterait le glissement du doigt une deuxieme
+    // fois (visee deux fois trop rapide, et le joystick ferait tourner la
+    // vue) et declencherait un tir des qu'un doigt se pose, n'importe ou.
+    // On ne la lit donc que sur PC : sur mobile, visee et boutons viennent
+    // uniquement de touch.c.
+#if !MOBILE_UI
     float sens = MOUSE_SENSITIVITY * (1.0f - ads * 0.35f);
     Vector2 md = GetMouseDelta();
     in.look.x = -md.x * sens;
     in.look.y = -md.y * sens;
+    in.fire = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    in.aim  = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+#endif
 
     // --- Clavier : direction voulue. KEY_* correspond à la POSITION des
     // touches (comme un QWERTY) : WASD marche donc en ZQSD sur un clavier
-    // AZERTY. On accepte aussi Z/Q au cas où le clavier serait mappé. ---
+    // AZERTY. On accepte aussi Z/Q au cas où le clavier serait mappé.
+    // Sans effet sur un telephone nu, et utile avec un clavier Bluetooth. ---
     if (IsKeyDown(KEY_W) || IsKeyDown(KEY_Z)) in.move.y += 1;   // avancer
     if (IsKeyDown(KEY_S)) in.move.y -= 1;                       // reculer
     if (IsKeyDown(KEY_D)) in.move.x += 1;                       // droite
     if (IsKeyDown(KEY_A) || IsKeyDown(KEY_Q)) in.move.x -= 1;   // gauche
-    in.fire = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
-    in.aim  = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
-    in.jump = IsKeyDown(KEY_SPACE);
-    in.sprint = IsKeyDown(KEY_LEFT_SHIFT);
+    if (IsKeyDown(KEY_SPACE)) in.jump = true;
+    if (IsKeyDown(KEY_LEFT_SHIFT)) in.sprint = true;
 
     // --- Doigts : s'ajoutent aux commandes ci-dessus (sans effet sur PC) ---
     TouchApply(&in, ads);
