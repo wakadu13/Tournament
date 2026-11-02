@@ -207,7 +207,15 @@ machine sans affichage.
 ./build/bot 127.0.0.1 Zombie
 ```
 
-Pour jouer en LAN, remplacer `127.0.0.1` par l'IP de la machine serveur.
+Le client et le bot prennent `hôte[:port]` : une IP comme un **nom DNS**,
+avec un port facultatif collé à l'adresse.
+
+```sh
+./build/client 192.168.1.20 Alice            # LAN, port 7777 par défaut
+./build/client jeu.exemple.fr Alice          # par son nom DNS
+./build/client jeu.exemple.fr:27015 Alice    # sur un autre port
+```
+
 L'équipe est attribuée automatiquement (auto-équilibrage) : connectez le
 bot **après** vous pour qu'il soit dans l'équipe adverse.
 
@@ -313,7 +321,7 @@ d'administration : le pare-feu de la machine ne suffit pas.
 Vérification depuis un autre poste :
 
 ```sh
-./client ADRESSE_DU_SERVEUR Alice
+./client ADRESSE_DU_SERVEUR Alice      # ou ADRESSE:PORT si ce n'est pas 7777
 # ou, sans le jeu :
 nc -u -z -v ADRESSE_DU_SERVEUR 7777
 ```
@@ -352,7 +360,9 @@ trafic de jeu va directement au VPS.
    `jeu.exemple.fr` → l'IP du VPS.
 2. **Désactiver le proxy** : le nuage doit être **gris** (« DNS only »),
    pas orange.
-3. Les joueurs se connectent avec `./client jeu.exemple.fr Alice`.
+3. Les joueurs se connectent avec `./client jeu.exemple.fr Alice` — le
+   client résout les noms DNS (`getaddrinfo`), il n'y a donc pas d'IP à
+   retenir.
 
 Avantages : gratuit, immédiat, et l'adresse reste lisible même si l'IP du
 serveur change. Limites : l'IP du serveur est publique et le port 7777
@@ -440,7 +450,8 @@ deux points (tout est derrière `MOBILE_UI` dans
 [src/client/main.c](src/client/main.c) et `TOUCH_ENABLED` dans
 [src/client/touch.c](src/client/touch.c)) :
 
-- **Écran d'accueil** : l'adresse du serveur se tape sur un pavé numérique,
+- **Écran d'accueil** : l'adresse du serveur se tape sur un pavé numérique
+  (le `:` permet de viser un autre port, par ex. `192.168.1.20:27015`),
   puis **CONNECTER**. Sur PC l'adresse reste un argument de la ligne de
   commande.
 - **Commandes tactiles**, reprises du premier jeu :

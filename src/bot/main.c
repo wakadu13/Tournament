@@ -76,11 +76,10 @@ static bool NetConnect(const char *ip, const char *name)
     if (SocketFailed(sock_fd)) { perror("socket"); return false; }
     SocketSetNonBlocking(sock_fd);
 
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(DEFAULT_PORT);
-    if (inet_pton(AF_INET, ip, &server_addr.sin_addr) != 1) {
-        printf("Adresse IP invalide : %s\n", ip);
+    // Accepte une IP comme un NOM DNS, et un port colle a l'hote
+    // (« jeu.exemple.fr:27015 ») ; sans port, DEFAULT_PORT s'applique.
+    if (!ResolveServerAddr(ip, DEFAULT_PORT, &server_addr)) {
+        printf("Serveur introuvable : %s\n", ip);
         return false;
     }
 

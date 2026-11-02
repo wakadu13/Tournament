@@ -228,11 +228,10 @@ static bool NetConnect(const char *ip, const char *name)
     if (SocketFailed(sock_fd)) return false;
     SocketSetNonBlocking(sock_fd);   // recvfrom ne bloquera jamais
 
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(DEFAULT_PORT);
-    if (inet_pton(AF_INET, ip, &server_addr.sin_addr) != 1) {
-        printf("Adresse IP invalide : %s\n", ip);
+    // Accepte une IP comme un NOM DNS, et un port colle a l'hote
+    // (« jeu.exemple.fr:27015 ») ; sans port, DEFAULT_PORT s'applique.
+    if (!ResolveServerAddr(ip, DEFAULT_PORT, &server_addr)) {
+        printf("Serveur introuvable : %s\n", ip);
         return false;
     }
 
@@ -1058,7 +1057,10 @@ static void DrawHUD(void)
 // false si le joueur quitte l'application.
 static bool MobileConnectScreen(char *ip, int cap, const char *name)
 {
-    static const char *keys[12] = { "1","2","3","4","5","6","7","8","9",".","0","<" };
+    // Pavé 3 x 4. Le « : » sert à viser un port autre que celui par défaut
+    // (« 192.168.1.20:27015 ») ; l'effacement a son propre bouton, à droite
+    // du champ de saisie.
+    static const char *keys[12] = { "1","2","3","4","5","6","7","8","9",".","0",":" };
     const Color BG = {18, 20, 26, 255};
     char msg[80] = "";
 
@@ -1070,6 +1072,8 @@ static bool MobileConnectScreen(char *ip, int cap, const char *name)
         float bw = 112, bh = 78, gap = 12;
         float gx = ui_w / 2 - (3 * bw + 2 * gap) / 2, gy = 236;
         Rectangle connect = { ui_w / 2 - 140, gy + 4 * (bh + gap) + 14, 280, 78 };
+        Rectangle field = { ui_w / 2 - 200, 150, 400, 62 };
+        Rectangle erase = { field.x + field.width + 12, field.y, 76, field.height };
 
         // --- Un appui : on teste les boutons sous le doigt ---
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -1080,8 +1084,11 @@ static bool MobileConnectScreen(char *ip, int cap, const char *name)
                 Rectangle r = { gx + (i % 3) * (bw + gap), gy + (i / 3) * (bh + gap), bw, bh };
                 if (!CheckCollisionPointRec(m, r)) continue;
                 size_t len = strlen(ip);
-                if (keys[i][0] == '<') { if (len > 0) ip[len - 1] = '\0'; }
-                else if (len + 1 < (size_t)cap) { ip[len] = keys[i][0]; ip[len + 1] = '\0'; }
+                if (len + 1 < (size_t)cap) { ip[len] = keys[i][0]; ip[len + 1] = '\0'; }
+            }
+            if (CheckCollisionPointRec(m, erase)) {
+                size_t len = strlen(ip);
+                if (len > 0) ip[len - 1] = '\0';
             }
             if (CheckCollisionPointRec(m, connect) && ip[0] != '\0') {
                 // NetConnect bloque jusqu'à 5 s (10 tentatives) : on affiche
@@ -1106,16 +1113,19 @@ static bool MobileConnectScreen(char *ip, int cap, const char *name)
 
         const char *title = "EMA TOURNAMENT";
         DrawText(title, (int)(ui_w / 2) - MeasureText(title, 44) / 2, 52, 44, RAYWHITE);
-        const char *sub2 = "Adresse du serveur";
+        const char *sub2 = "Adresse du serveur (port 7777 par defaut)";
         DrawText(sub2, (int)(ui_w / 2) - MeasureText(sub2, 20) / 2, 112, 20, GRAY);
 
-        // Champ de saisie
-        Rectangle field = { ui_w / 2 - 200, 150, 400, 62 };
+        // Champ de saisie, et son bouton d'effacement
         DrawRectangleRec(field, Fade(BLACK, 0.5f));
         DrawRectangleLinesEx(field, 2, Fade(RAYWHITE, 0.4f));
         const char *shown = (ip[0] != '\0') ? ip : "___.___.___.___";
         DrawText(shown, (int)(field.x + field.width / 2) - MeasureText(shown, 34) / 2,
                  (int)field.y + 14, 34, ip[0] ? RAYWHITE : DARKGRAY);
+        DrawRectangleRec(erase, Fade(RAYWHITE, 0.14f));
+        DrawRectangleLinesEx(erase, 1, Fade(RAYWHITE, 0.3f));
+        DrawText("<", (int)(erase.x + erase.width / 2) - MeasureText("<", 32) / 2,
+                 (int)(erase.y + erase.height / 2) - 16, 32, RAYWHITE);
 
         // Pavé
         for (int i = 0; i < 12; i++) {

@@ -48,6 +48,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>   /* atoi, pour le port colle a l'hote */
 #include <math.h>
 #include <string.h>
 
@@ -67,6 +68,7 @@
     #include <arpa/inet.h>
     #include <errno.h>
     #include <fcntl.h>
+    #include <netdb.h>          /* getaddrinfo : résolution des noms d'hôtes */
     #include <netinet/in.h>
     #include <sys/socket.h>
     #include <sys/types.h>
@@ -136,6 +138,52 @@ static inline bool SocketSetNonBlocking(socket_t s)
 /* Vrai si la socket n'a pas pu être créée (le test diffère : sous Windows
    SOCKET est un type non signé, « < 0 » ne veut rien dire). */
 static inline bool SocketFailed(socket_t s) { return s == SOCKET_NONE; }
+
+/* --- Résolution de l'adresse du serveur -------------------------------- */
+
+/*
+ * Convertit « hôte » ou « hôte:port » en adresse UDP prête à l'emploi.
+ *
+ * On passe par getaddrinfo et NON par inet_pton : inet_pton n'accepte que
+ * des adresses numériques, alors que getaddrinfo accepte aussi bien
+ * « 192.168.1.10 » qu'un NOM DNS comme « jeu.exemple.fr ». C'est
+ * indispensable pour pointer un nom (Cloudflare en DNS seul, DuckDNS...)
+ * sur le serveur au lieu de retenir une IP.
+ *
+ * Le port peut être collé à l'hôte — « jeu.exemple.fr:27015 » — sinon
+ * default_port s'applique. Renvoie false si le nom est introuvable.
+ */
+static inline bool ResolveServerAddr(const char *host_arg, unsigned short default_port,
+                                     struct sockaddr_in *out)
+{
+    char host[256];
+    unsigned short port = default_port;
+
+    /* Séparer un éventuel « :port » (le dernier deux-points seulement, pour
+       ne pas couper une adresse IPv6 ; on ne gère que l'IPv4 ici, mais
+       autant ne pas se tromper de deux-points). */
+    size_t n = strlen(host_arg);
+    if (n == 0 || n >= sizeof(host)) return false;
+    memcpy(host, host_arg, n + 1);
+    char *colon = strrchr(host, ':');
+    if (colon != NULL && colon[1] != '\0') {
+        int p = atoi(colon + 1);
+        if (p > 0 && p < 65536) { port = (unsigned short)p; *colon = '\0'; }
+    }
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;          /* IPv4 : c'est ce que parle le protocole */
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) return false;
+
+    memset(out, 0, sizeof(*out));
+    *out = *(struct sockaddr_in *)(void *)res->ai_addr;
+    out->sin_family = AF_INET;
+    out->sin_port = htons(port);
+    freeaddrinfo(res);
+    return true;
+}
 
 /* --- Temps ------------------------------------------------------------- */
 
