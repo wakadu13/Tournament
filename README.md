@@ -92,6 +92,22 @@ stance ......... le sol sous lui : porte les pattes, encaisse la chute
     tail ....... pivot de la queue : elle bat
 ```
 
+### Un seul appel de dessin par image
+
+Chaque `Ball` / `Box3` / `Seg` était un `DrawModel` à part : une
+soixantaine par poussin, un millier par image à 16 joueurs. Sur un
+téléphone en OpenGL ES 2, c'est l'appel de dessin qui coûte, pas le
+triangle — et l'instanciation n'y existe pas. Entre `BatchBegin()` et
+`BatchEnd()`, `DrawPart` transforme sur le CPU les sommets des trois
+maillages unitaires et les ajoute à un maillage dynamique, envoyé et
+dessiné **une fois par image** : tous les personnages et l'enseigne tiennent
+dans un appel.
+
+Comme le CPU tient les sommets, l'ombrage est **cuit dans la couleur** de
+chacun (70 % d'ambiance, 30 % selon l'angle entre la normale et la lumière)
+: du relief là où tout était plat, sans shader, pour un coût nul au rendu.
+Hors d'un lot, les primitives se dessinent une à une comme avant.
+
 ### Ce qui bouge sur un poussin zombie
 
 Tout l'état d'animation tient dans un `CharAnim` par joueur
