@@ -34,6 +34,16 @@
 void ModelsInit(void);    // crée le cube, la sphère et le cylindre (après InitWindow)
 void ModelsClose(void);   // les libère (avant CloseWindow)
 
+// Regroupement des primitives en UN SEUL maillage par image. Entre
+// BatchBegin et BatchEnd, chaque Ball / Box3 / Seg n'est plus un appel de
+// dessin : ses sommets sont transformés sur le CPU et ajoutés à un maillage
+// dynamique, envoyé et dessiné une fois à BatchEnd. Tous les personnages et
+// l'enseigne tiennent dans un appel au lieu d'un millier — c'est ce qui
+// compte sur un téléphone, où chaque appel coûte cher. Hors d'un lot, les
+// primitives se dessinent une à une comme avant.
+void BatchBegin(void);
+void BatchEnd(void);
+
 //----------------------------------------------------------------------------------
 // Primitives (mêmes signatures que render.h du premier jeu)
 //----------------------------------------------------------------------------------

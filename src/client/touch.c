@@ -68,13 +68,15 @@ static bool    aim_toggle;     // VISER est une bascule, pas un maintien
 static bool    aim_was_down;   // pour ne basculer qu'au moment de l'appui
 static float   vw = 1280.0f, vh = 720.0f;   // écran en unités d'interface
 
-// Position des boutons, calée sur le coin bas droit (TIRER sous le pouce).
+// Position des boutons, calée sur le coin bas droit (TIRER sous le pouce),
+// décalée de 44 unités vers la gauche : la barre de navigation Android à
+// trois boutons occupe ~90 unités du bord droit et chevauchait TIRER.
 static int Buttons(Button *b)
 {
     int n = 0;
-    b[n++] = (Button){ TR_FIRE, { vw - 112.0f, vh - 112.0f }, 60 };
-    b[n++] = (Button){ TR_AIM,  { vw - 236.0f, vh -  64.0f }, 38 };
-    b[n++] = (Button){ TR_JUMP, { vw -  64.0f, vh - 236.0f }, 36 };
+    b[n++] = (Button){ TR_FIRE, { vw - 156.0f, vh - 112.0f }, 60 };
+    b[n++] = (Button){ TR_AIM,  { vw - 280.0f, vh -  64.0f }, 38 };
+    b[n++] = (Button){ TR_JUMP, { vw - 108.0f, vh - 236.0f }, 36 };
     return n;
 }
 

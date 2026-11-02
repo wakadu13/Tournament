@@ -43,12 +43,72 @@
 static Model mCube, mSphere, mCyl;
 static bool  ready = false;
 
+//----------------------------------------------------------------------------------
+// Lot (batch) : un seul maillage par image
+//----------------------------------------------------------------------------------
+// Les trois maillages unitaires sont « dépliés » une fois pour toutes en
+// listes de triangles (position + normale par sommet). Pendant un lot,
+// chaque primitive transforme ces sommets par sa matrice monde et les
+// ajoute à un grand tampon ; BatchEnd envoie le tampon au GPU et le
+// dessine d'un coup. Le GPU ne reçoit que positions et couleurs : pas de
+// normales, l'ombrage est CUIT dans la couleur de chaque sommet (voir
+// Shade() plus bas), ce qui donne du relief sans shader.
+enum { SRC_CUBE, SRC_SPHERE, SRC_CYL, SRC_COUNT };
+typedef struct { Vector3 *pos, *nrm; int count; } SourceTris;
+static SourceTris src[SRC_COUNT];
+
+#define BATCH_MAX_VERTS 400000    // ~16 personnages + l'enseigne, avec de la marge
+static Mesh           batch;      // maillage dynamique (positions + couleurs)
+static Material       batchMat;
+static float         *bpos;       // BATCH_MAX_VERTS * 3
+static unsigned char *bcol;       // BATCH_MAX_VERTS * 4
+static int            bused = 0;
+static bool           batching = false;
+
+// Lumière du monde pour l'ombrage cuit : de haut, légèrement de côté
+static const Vector3 LIGHT_DIR = { 0.36f, 0.86f, 0.36f };
+
+// Déplie un maillage raylib (indexé ou non) en liste de triangles
+static void ExpandMesh(const Mesh *m, SourceTris *out)
+{
+    int n = m->triangleCount * 3;
+    out->count = n;
+    out->pos = (Vector3 *)MemAlloc((unsigned)n * sizeof(Vector3));
+    out->nrm = (Vector3 *)MemAlloc((unsigned)n * sizeof(Vector3));
+    for (int i = 0; i < n; i++) {
+        int v = m->indices ? (int)m->indices[i] : i;
+        out->pos[i] = P3(m->vertices[v * 3], m->vertices[v * 3 + 1], m->vertices[v * 3 + 2]);
+        out->nrm[i] = m->normals
+            ? P3(m->normals[v * 3], m->normals[v * 3 + 1], m->normals[v * 3 + 2])
+            : P3(0, 1, 0);
+    }
+}
+
 void ModelsInit(void)
 {
     if (ready) return;
+    // Sphère en 8 x 10 : la finesse du premier EMATournament. Avec le lot,
+    // chaque sommet coûte du CPU et de la bande passante, plus la sphère
+    // est fine, plus l'image est chère.
     mCube   = LoadModelFromMesh(GenMeshCube(1, 1, 1));
-    mSphere = LoadModelFromMesh(GenMeshSphere(1, 12, 16));
-    mCyl    = LoadModelFromMesh(GenMeshCylinder(1, 1, 14));
+    mSphere = LoadModelFromMesh(GenMeshSphere(1, 8, 10));
+    mCyl    = LoadModelFromMesh(GenMeshCylinder(1, 1, 12));
+    ExpandMesh(&mCube.meshes[0],   &src[SRC_CUBE]);
+    ExpandMesh(&mSphere.meshes[0], &src[SRC_SPHERE]);
+    ExpandMesh(&mCyl.meshes[0],    &src[SRC_CYL]);
+
+    // Le maillage du lot : tampons à la taille maximale, mis à jour à
+    // chaque image (UploadMesh dynamique). Pas de texcoords ni de normales :
+    // raylib leur donne une valeur par défaut.
+    bpos = (float *)MemAlloc(BATCH_MAX_VERTS * 3 * sizeof(float));
+    bcol = (unsigned char *)MemAlloc(BATCH_MAX_VERTS * 4);
+    memset(&batch, 0, sizeof(batch));
+    batch.vertexCount = BATCH_MAX_VERTS;
+    batch.triangleCount = BATCH_MAX_VERTS / 3;
+    batch.vertices = bpos;
+    batch.colors = bcol;
+    UploadMesh(&batch, true);
+    batchMat = LoadMaterialDefault();
     ready = true;
 }
 
@@ -58,15 +118,88 @@ void ModelsClose(void)
     UnloadModel(mCube);
     UnloadModel(mSphere);
     UnloadModel(mCyl);
+    for (int i = 0; i < SRC_COUNT; i++) { MemFree(src[i].pos); MemFree(src[i].nrm); }
+    // Le maillage du lot pointe sur nos tampons : on détache avant de libérer
+    batch.vertices = NULL;
+    batch.colors = NULL;
+    UnloadMesh(batch);
+    UnloadMaterial(batchMat);
+    MemFree(bpos);
+    MemFree(bcol);
     ready = false;
 }
 
+// Envoie ce qui est accumulé et le dessine en un appel
+static void BatchFlush(void)
+{
+    if (bused == 0) return;
+    UpdateMeshBuffer(batch, 0, bpos, bused * 3 * (int)sizeof(float), 0);   // positions
+    UpdateMeshBuffer(batch, 3, bcol, bused * 4, 0);                        // couleurs
+    batch.vertexCount = bused;
+    batch.triangleCount = bused / 3;
+    DrawMesh(batch, batchMat, MatrixIdentity());
+    bused = 0;
+}
+
+void BatchBegin(void)
+{
+    if (!ready) return;
+    batching = true;
+    bused = 0;
+}
+
+void BatchEnd(void)
+{
+    if (!ready) return;
+    BatchFlush();
+    batching = false;
+}
+
+// Ajoute un maillage unitaire transformé par world, teinté c, avec
+// l'ombrage cuit dans la couleur : 70 % d'ambiance + 30 % selon l'angle
+// entre la normale et la lumière. Modéré exprès : les couleurs des
+// uniformes et des plumes restent reconnaissables.
+static void BatchAppend(const SourceTris *t, Matrix world, Color c)
+{
+    if (bused + t->count > BATCH_MAX_VERTS) BatchFlush();   // plein : on dessine et on continue
+    // Les normales se transforment par la partie 3x3 de la matrice (sans
+    // la translation) puis se renormalisent ; avec une mise à l'échelle non
+    // uniforme ce n'est qu'approché, largement assez pour un ombrage.
+    for (int i = 0; i < t->count; i++) {
+        Vector3 p = Vector3Transform(t->pos[i], world);
+        Vector3 n = t->nrm[i];
+        Vector3 wn = {
+            n.x * world.m0 + n.y * world.m4 + n.z * world.m8,
+            n.x * world.m1 + n.y * world.m5 + n.z * world.m9,
+            n.x * world.m2 + n.y * world.m6 + n.z * world.m10,
+        };
+        float len = sqrtf(wn.x * wn.x + wn.y * wn.y + wn.z * wn.z);
+        float d = (len > 1e-6f) ? (wn.x * LIGHT_DIR.x + wn.y * LIGHT_DIR.y + wn.z * LIGHT_DIR.z) / len : 0.0f;
+        float k = 0.70f + 0.30f * (d > 0.0f ? d : 0.0f);
+        float *bp = &bpos[bused * 3];
+        bp[0] = p.x; bp[1] = p.y; bp[2] = p.z;
+        unsigned char *bc = &bcol[bused * 4];
+        bc[0] = (unsigned char)(c.r * k);
+        bc[1] = (unsigned char)(c.g * k);
+        bc[2] = (unsigned char)(c.b * k);
+        bc[3] = c.a;
+        bused++;
+    }
+}
+
 // Dessine un maillage avec sa matrice monde et sa teinte (le DrawPart du
-// premier jeu). DrawModel compose model.transform avec la position et
-// l'échelle qu'on lui donne : à (0,0,0) et 1.0, c'est exactement world.
+// premier jeu). Dans un lot : accumulé, dessiné à BatchEnd. Hors lot :
+// DrawModel compose model.transform avec la position et l'échelle qu'on
+// lui donne ; à (0,0,0) et 1.0, c'est exactement world.
 static void DrawPart(Model *m, Matrix world, Color c)
 {
     if (!ready) return;   // appelé avant ModelsInit : on ne dessine rien
+    if (batching) {
+        const SourceTris *t = (m == &mCube) ? &src[SRC_CUBE]
+                            : (m == &mSphere) ? &src[SRC_SPHERE] : &src[SRC_CYL];
+        BatchAppend(t, world, c);
+        return;
+    }
     m->transform = world;
     DrawModel(*m, P3(0, 0, 0), 1.0f, c);
 }

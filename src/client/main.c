@@ -1236,6 +1236,19 @@ static bool MobileConnectScreen(char *ip, int cap, const char *name)
         // aussi le comportement attendu d'un bouton.
         int  touches = GetTouchPointCount();
         bool down = IsMouseButtonDown(MOUSE_BUTTON_LEFT) || touches > 0;
+        // Témoin pour logcat, une fois par seconde : l'état BRUT des entrées
+        // tel que raylib le rapporte. Si aucun contact n'apparaît jamais ici
+        // alors que l'écran est touché, les événements n'atteignent pas le
+        // jeu — ce n'est pas la logique du pavé qui est en cause.
+        {
+            static double last_log = 0.0;
+            double now = GetTime();
+            if (now - last_log >= 1.0) {
+                last_log = now;
+                TraceLog(LOG_INFO, "TACTILE: etat touches=%d souris=%d image=%.0f",
+                         touches, IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1 : 0, now);
+            }
+        }
         if (down) {
             held = true;
             held_pos = (touches > 0) ? GetTouchPosition(0) : GetMousePosition();
@@ -1414,8 +1427,10 @@ int main(int argc, char **argv)
         ClearBackground((Color){135, 170, 200, 255});   // ciel
 
         BeginMode3D(cam);       // 1) la scène : map + joueurs + traçantes
-        DrawMap();
+        BatchBegin();           //    toutes les primitives des personnages et de
+        DrawMap();              //    l'enseigne dans UN maillage, dessiné à BatchEnd
         DrawPlayers();
+        BatchEnd();
         EndMode3D();
 
         DrawViewModel();        // 2) l'arme, par-dessus la scène

@@ -26,11 +26,27 @@ mkdir -p "$OUT"
 adb root || true
 adb wait-for-device
 adb install -r "$APK"            # -r : remplace une version deja installee
-adb logcat -c                    # on ne garde que les logs de ce test
-adb shell am start -n $PKG/android.app.NativeActivity
-sleep 25                         # demarrage, emulateur lent
+
+# L'emulateur demarre en PORTRAIT. Au lancement, le systeme applique
+# l'orientation paysage du manifeste et RECREE l'activite : raylib
+# s'initialise deux fois, et la file d'entrees ne se rattache pas toujours
+# au second looper (ecran vivant, aucun contact percu — vu en CI). En
+# mettant l'emulateur en paysage AVANT de lancer, il n'y a plus de
+# rotation, donc une seule initialisation.
+adb shell settings put system accelerometer_rotation 0
+adb shell settings put system user_rotation 1      # 1 = paysage (90 degres)
+sleep 2
+
+# Lance le jeu et attend l'ecran d'accueil. Rend le PID.
+launch_game() {
+    adb logcat -c                # on ne garde que les logs de cette tentative
+    adb shell am start -n $PKG/android.app.NativeActivity
+    sleep 25                     # demarrage, emulateur lent
+    PID=$(adb shell pidof $PKG | tr -d '\r')
+    echo "initialisations de raylib : $(adb logcat -d -s raylib | grep -c 'Initializing raylib')"
+}
+launch_game
 adb exec-out screencap -p > "$OUT/android-1-accueil.png"
-PID=$(adb shell pidof $PKG | tr -d '\r')
 adb shell debuggerd -b "$PID" > "$OUT/android-threads.txt" 2>&1 || true
 
 # Taille de l'ecran telle que LE JEU la voit. On la lit dans le log de
@@ -73,8 +89,20 @@ key() {
 }
 # Disposition :  1 2 3 / 4 5 6 / 7 8 9 / . 0 :
 # "10.0.2.2" = 1(0,0)  0(1,3)  .(0,3)  0(1,3)  .(0,3)  2(1,0)  .(0,3)  2(1,0)
-key 0 0; key 1 3; key 0 3; key 1 3; key 0 3; key 1 0; key 0 3; key 1 0
+type_address() { key 0 0; key 1 3; key 0 3; key 1 3; key 0 3; key 1 0; key 0 3; key 1 0; }
+type_address
 sleep 1
+# Le jeu journalise chaque appui accepte (« TACTILE: appui relache »). S'il
+# n'en a vu AUCUN, les evenements n'atteignent pas le processus : on relance
+# l'application une fois, en le disant, et on retape.
+if [ "$(adb logcat -d -s raylib | grep -c 'TACTILE: appui')" -eq 0 ]; then
+    echo "AUCUN appui percu par le jeu : relance de l'application (tentative 2)"
+    adb shell am force-stop $PKG
+    sleep 2
+    launch_game
+    type_address
+    sleep 1
+fi
 adb exec-out screencap -p > "$OUT/android-2-adresse.png"
 
 # CONNECTER : bouton de 280 x 78 centre en x, a y = 236 + 4*90 + 14 + 39 = 649
@@ -82,10 +110,10 @@ press "$(ux 0)" "$(uy 649)"
 sleep 12                         # connexion + premieres images de jeu
 adb exec-out screencap -p > "$OUT/android-3-jeu.png"
 
-# Appui long sur TIRER : centre a (112, 112) unites du coin bas droit.
-# swipe sur place pendant 3000 ms = appui long, en arriere-plan pour
-# capturer pendant le tir.
-FX=$(( W - 112 * H / 720 )); FY=$(( H - 112 * H / 720 ))
+# Appui long sur TIRER : centre a (156, 112) unites du coin bas droit
+# (voir Buttons() dans client/touch.c). swipe sur place pendant 3000 ms =
+# appui long, en arriere-plan pour capturer pendant le tir.
+FX=$(( W - 156 * H / 720 )); FY=$(( H - 112 * H / 720 ))
 adb shell input swipe $FX $FY $FX $FY 3000 &
 sleep 1.5
 adb exec-out screencap -p > "$OUT/android-4-tir.png"
