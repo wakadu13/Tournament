@@ -10,8 +10,12 @@
 #define WEAPON_DAMAGE       25
 #define WEAPON_RANGE        100.0f
 #define WEAPON_COOLDOWN     0.15f   // secondes entre deux tirs
-#define RESPAWN_DELAY       3.0f    // secondes avant respawn
-#define SCORE_LIMIT         30      // kills pour gagner le match
+// Manches à élimination (comme dans Counter-Strike) : pas de respawn
+// pendant une manche ; l'équipe qui n'a plus de survivant perd la manche.
+#define ROUNDS_TO_WIN       5       // manches pour gagner le match
+#define ROUND_TIME          120.0f  // durée maximale d'une manche (s) : au-delà,
+                                    // l'équipe avec le plus de survivants l'emporte
+#define ROUND_END_DELAY     4.0f    // pause entre deux manches (s)
 
 #define PLAYER_SPEED        7.0f    // m/s
 #define SPRINT_SPEED        10.5f   // m/s en sprint
@@ -34,7 +38,7 @@ typedef struct {
 
 #define ARENA_HALF 30.0f    // l'arène fait 60x60 m
 
-#define MAP_BOX_COUNT 13
+#define MAP_BOX_COUNT 20
 extern const Box MAP_BOXES[MAP_BOX_COUNT];
 
 #define SPAWNS_PER_TEAM 4

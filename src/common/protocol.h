@@ -8,7 +8,10 @@
 // positions. Le serveur simule lui-meme : un client modifie ne peut plus se
 // teleporter. Les tirs portent l'instant que le tireur VOYAIT, et le serveur
 // rembobine les cibles a cet instant (compensation de lag).
-#define PROTO_VERSION   2
+// v3 : manches a elimination. Plus de respawn pendant une manche ; une
+// equipe sans survivant perd la manche ; le snapshot porte la manche, sa
+// phase et son chrono.
+#define PROTO_VERSION   3
 #define DEFAULT_PORT    7777
 
 #define MAX_PLAYERS     16
@@ -61,7 +64,16 @@ typedef enum {
     EV_PLAYER_JOIN,     // a = joueur
     EV_PLAYER_LEAVE,    // a = joueur
     EV_MATCH_OVER,      // a = équipe gagnante
+    EV_ROUND_START,     // a = numéro de manche
+    EV_ROUND_END,       // a = équipe gagnante (TEAM_COUNT = manche nulle), b = numéro
 } EventType;
+
+// Phase de la manche en cours
+typedef enum {
+    ROUND_WAIT = 0,     // il manque une équipe : on attend
+    ROUND_PLAY,         // manche en cours
+    ROUND_END,          // manche finie, pause avant la suivante
+} RoundPhase;
 
 #pragma pack(push, 1)
 
@@ -156,9 +168,13 @@ typedef struct {
 typedef struct {
     uint8_t        type;    // PKT_SV_SNAPSHOT
     uint32_t       tick;
-    uint16_t       score[TEAM_COUNT];
+    uint16_t       score[TEAM_COUNT];   // MANCHES gagnées par équipe
     uint8_t        match_over;      // 1 si le match est fini
     uint8_t        winner;          // équipe gagnante si match_over
+    uint8_t        round;           // numéro de la manche en cours (1..)
+    uint8_t        round_phase;     // RoundPhase
+    uint8_t        round_winner;    // en ROUND_END : équipe gagnante, TEAM_COUNT = nulle
+    float          round_time;      // secondes restantes (PLAY) ou avant la suivante (END)
     SnapshotPlayer players[MAX_PLAYERS];
 } PacketSnapshot;
 

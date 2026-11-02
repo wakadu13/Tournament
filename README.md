@@ -1,8 +1,40 @@
 # EMA Tournament — FPS multijoueur (Team Deathmatch)
 
 FPS multijoueur en C avec [raylib](https://www.raylib.com/) : deux équipes
-(rouge vs bleue) s'affrontent dans un match à mort par équipe. Première
-équipe à **30 kills** gagne.
+(rouge vs bleue) s'affrontent par **manches à élimination**, comme dans
+Counter-Strike, sur une carte inspirée de **Dust**.
+
+## Le mode de jeu
+
+- Une manche commence avec tout le monde vivant à son spawn. **Pas de
+  respawn** : un membre éliminé le reste jusqu'à la fin de la manche (son
+  corps reste au sol).
+- L'équipe qui **n'a plus aucun survivant perd la manche**. Si les deux
+  derniers tombent en même temps, la manche est nulle.
+- Une manche dure au plus **2 minutes** (`ROUND_TIME`) : au temps, l'équipe
+  qui a le plus de survivants l'emporte ; à égalité, manche nulle.
+- Le match se joue en **5 manches gagnantes** (`ROUNDS_TO_WIN`), avec 4 s de
+  pause entre deux manches.
+- Un joueur qui arrive **en cours de manche** attend la suivante, éliminé
+  d'office. S'il manque une équipe, le serveur attend.
+
+Le HUD affiche les manches gagnées de chaque côté, le numéro de manche et
+le chrono au centre, et un point par survivant sous chaque score.
+
+## La carte
+
+Inspirée de Dust, ramenée à une arène de 60 × 60 m faite de boîtes
+(`MAP_BOXES` dans [src/common/game.c](src/common/game.c)). Les T (bleus)
+partent au sud, les CT (rouges) au nord, et trois chemins les relient :
+
+| Voie | Description |
+|---|---|
+| **Mid** | au centre, deux piliers « double doors » et le pilier de l'enseigne, avec un passage de chaque côté ; deux caisses basses |
+| **Long A** | à l'est, un couloir de 10 m longé d'un mur, qui débouche au nord sur le site A et ses caisses |
+| **Tunnels B** | à l'ouest, un couloir étroit et **couvert** (un toit à 3,2 m laisse passer les joueurs mais bloque les tirs en cloche) vers le site B |
+
+Les voies restent assez ouvertes pour que les bots, qui marchent droit et
+contournent grossièrement, s'y retrouvent.
 
 Les joueurs humains incarnent des **soldats-mercenaires** (treillis olive,
 visage peint en vert, yeux injectés de sang, démarche bras tendus) ; les
@@ -520,7 +552,7 @@ s'activent sur PC, la souris jouant le rôle du doigt.
 ## Réglages de gameplay
 
 Tout est dans [src/common/game.h](src/common/game.h) : dégâts, cadence,
-vitesse, gravité, délai de respawn, limite de score... et la map elle-même
+vitesse, gravité, durée d'une manche, manches gagnantes... et la map elle-même
 dans [src/common/game.c](src/common/game.c) (liste de boîtes `MAP_BOXES`).
 Les réglages de la vue FPS (FOV, sensibilité, accélérations) sont en tête
 de [src/client/main.c](src/client/main.c).

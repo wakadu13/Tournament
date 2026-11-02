@@ -40,7 +40,6 @@ typedef struct {
     uint8_t spawn_count;    // +1 à chaque respawn (voir protocol.h)
     int   health;
     int   kills, deaths;
-    float respawn_timer;
     float shoot_cooldown;
     double last_heard;      // pour le timeout
 } Player;
@@ -60,6 +59,12 @@ static int      team_score[TEAM_COUNT];
 static bool     match_over = false;
 static int      winner = 0;
 static uint32_t tick = 0;
+
+// --- Manches à élimination ---
+static int        round_no = 0;
+static RoundPhase round_phase = ROUND_WAIT;
+static float      round_timer = 0.0f;
+static int        round_winner = TEAM_COUNT;   // en ROUND_END ; TEAM_COUNT = nulle
 static socket_t sock_fd = SOCKET_NONE;
 
 // Horloge monotone de la boucle de simulation (voir platform.h)
@@ -101,8 +106,7 @@ static void SpawnPlayer(Player *p)
     p->pitch = 0.0f;
     p->health = PLAYER_MAX_HEALTH;
     p->alive = true;
-    p->spawn_count++;       // invalide les paquets de position d'avant la mort
-    p->respawn_timer = 0.0f;
+    p->spawn_count++;       // invalide les entrées d'avant la mort
     p->shoot_cooldown = 0.0f;
 }
 
@@ -113,6 +117,95 @@ static int CountTeam(Team t)
         if (players[i].active && players[i].team == t) n++;
     }
     return n;
+}
+
+static int CountAlive(Team t)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_PLAYERS; i++)
+        if (players[i].active && players[i].alive && players[i].team == t) n++;
+    return n;
+}
+
+// Nouvelle manche : tout le monde revit à son spawn. SpawnPlayer incrémente
+// spawn_count, ce qui fait repartir la prédiction du client de zéro.
+static void StartRound(void)
+{
+    round_no++;
+    round_phase = ROUND_PLAY;
+    round_timer = ROUND_TIME;
+    round_winner = TEAM_COUNT;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (!players[i].active) continue;
+        SpawnPlayer(&players[i]);
+        BroadcastEvent(EV_RESPAWN, i, 0, 0);
+    }
+    BroadcastEvent(EV_ROUND_START, (uint8_t)round_no, 0, 0);
+    printf("[~] Manche %d : %d ROUGE contre %d BLEU\n", round_no,
+           CountTeam(TEAM_RED), CountTeam(TEAM_BLUE));
+}
+
+// Fin de manche : un point à l'équipe gagnante (aucun si nulle), pause,
+// et le match se termine à ROUNDS_TO_WIN.
+static void EndRound(int win)
+{
+    round_phase = ROUND_END;
+    round_timer = ROUND_END_DELAY;
+    round_winner = win;
+    if (win < TEAM_COUNT) team_score[win]++;
+    BroadcastEvent(EV_ROUND_END, (uint8_t)win, (uint8_t)round_no, 0);
+    if (win < TEAM_COUNT)
+        printf("[~] Manche %d : %s l'emporte (%d - %d)\n", round_no,
+               win == TEAM_RED ? "ROUGE" : "BLEU", team_score[TEAM_RED], team_score[TEAM_BLUE]);
+    else
+        printf("[~] Manche %d : nulle (%d - %d)\n", round_no,
+               team_score[TEAM_RED], team_score[TEAM_BLUE]);
+
+    if (win < TEAM_COUNT && team_score[win] >= ROUNDS_TO_WIN) {
+        match_over = true;
+        winner = win;
+        BroadcastEvent(EV_MATCH_OVER, (uint8_t)winner, 0, 0);
+        printf("[*] MATCH TERMINÉ — victoire équipe %s\n",
+               winner == TEAM_RED ? "ROUGE" : "BLEUE");
+    }
+}
+
+// La machine à états des manches, appelée à chaque tick.
+//   WAIT -> PLAY dès que les deux équipes ont au moins un membre ;
+//   PLAY -> END quand une équipe n'a plus de survivant (les deux en même
+//           temps : nulle), ou au temps (le plus de survivants l'emporte) ;
+//   END  -> PLAY après la pause ; une équipe vide renvoie en WAIT.
+static void UpdateRound(float dt)
+{
+    if (match_over) return;
+    bool both = CountTeam(TEAM_RED) > 0 && CountTeam(TEAM_BLUE) > 0;
+    switch (round_phase) {
+    case ROUND_WAIT:
+        if (both) StartRound();
+        break;
+    case ROUND_PLAY: {
+        if (!both) {
+            round_phase = ROUND_WAIT;
+            printf("[~] Manche %d annulée : une équipe est vide\n", round_no);
+            break;
+        }
+        round_timer -= dt;
+        int ar = CountAlive(TEAM_RED), ab = CountAlive(TEAM_BLUE);
+        if (ar == 0 && ab == 0)      EndRound(TEAM_COUNT);
+        else if (ar == 0)            EndRound(TEAM_BLUE);
+        else if (ab == 0)            EndRound(TEAM_RED);
+        else if (round_timer <= 0.0f)
+            EndRound(ar > ab ? TEAM_RED : (ab > ar ? TEAM_BLUE : TEAM_COUNT));
+        break;
+    }
+    case ROUND_END:
+        round_timer -= dt;
+        if (round_timer <= 0.0f) {
+            if (both) StartRound();
+            else round_phase = ROUND_WAIT;
+        }
+        break;
+    }
 }
 
 static void HandleConnect(const PacketConnect *pkt, const struct sockaddr_in *from)
@@ -156,6 +249,10 @@ static void HandleConnect(const PacketConnect *pkt, const struct sockaddr_in *fr
     p->is_bot = pkt->is_bot != 0;
     p->last_heard = Now();
     SpawnPlayer(p);
+    // En cours de manche, on attend la suivante : posé au spawn mais
+    // éliminé d'office, comme dans Counter-Strike. Sinon la manche
+    // (re)démarre au prochain tick et le fera apparaître vivant.
+    if (round_phase == ROUND_PLAY) { p->alive = false; p->health = 0; }
 
     PacketAccept acc = {PKT_SV_ACCEPT, (uint8_t)slot, (uint8_t)p->team};
     SendTo(from, &acc, sizeof(acc));
@@ -238,22 +335,14 @@ static void HandleShoot(const PacketShoot *pkt, const struct sockaddr_in *from)
     BroadcastEvent(EV_HIT, pkt->player_id, hit_id, WEAPON_DAMAGE);
 
     if (victim->health <= 0) {
+        // Éliminé pour toute la manche : pas de respawn. C'est UpdateRound
+        // qui constatera, au prochain tick, qu'une équipe n'a plus personne.
         victim->alive = false;
         victim->deaths++;
-        victim->respawn_timer = RESPAWN_DELAY;
         shooter->kills++;
-        team_score[shooter->team]++;
         BroadcastEvent(EV_KILL, pkt->player_id, hit_id, 0);
-        printf("[*] %s a éliminé %s (%d - %d)\n", shooter->name, victim->name,
-               team_score[TEAM_RED], team_score[TEAM_BLUE]);
-
-        if (team_score[shooter->team] >= SCORE_LIMIT) {
-            match_over = true;
-            winner = shooter->team;
-            BroadcastEvent(EV_MATCH_OVER, winner, 0, 0);
-            printf("[*] MATCH TERMINÉ — victoire équipe %s\n",
-                   winner == TEAM_RED ? "ROUGE" : "BLEUE");
-        }
+        printf("[*] %s a éliminé %s (survivants : %d ROUGE, %d BLEU)\n",
+               shooter->name, victim->name, CountAlive(TEAM_RED), CountAlive(TEAM_BLUE));
     }
 }
 
@@ -364,6 +453,10 @@ static void SendSnapshot(void)
     snap.score[TEAM_BLUE] = (uint16_t)team_score[TEAM_BLUE];
     snap.match_over = match_over ? 1 : 0;
     snap.winner = (uint8_t)winner;
+    snap.round = (uint8_t)round_no;
+    snap.round_phase = (uint8_t)round_phase;
+    snap.round_winner = (uint8_t)round_winner;
+    snap.round_time = round_timer > 0.0f ? round_timer : 0.0f;
 
     for (int i = 0; i < MAX_PLAYERS; i++) {
         Player *p = &players[i];
@@ -450,14 +543,8 @@ int main(int argc, char **argv)
                     continue;
                 }
                 if (p->shoot_cooldown > 0.0f) p->shoot_cooldown -= dt;
-                if (!p->alive && !match_over) {
-                    p->respawn_timer -= dt;
-                    if (p->respawn_timer <= 0.0f) {
-                        SpawnPlayer(p);
-                        BroadcastEvent(EV_RESPAWN, i, 0, 0);
-                    }
-                }
             }
+            UpdateRound(dt);
         }
 
         if (now - last_snap >= snap_dt) {

@@ -393,6 +393,18 @@ static void HandleEvent(const PacketEvent *ev)
         // sinon son cadavre se relèverait avant de se téléporter.
         if (ev->a < MAX_PLAYERS) CharAnimTeleport(&anim[ev->a]);
         break;
+    case EV_ROUND_START:
+        snprintf(line, sizeof(line), "Manche %d", ev->a);
+        KillfeedPush(line);
+        break;
+    case EV_ROUND_END:
+        if (ev->a < TEAM_COUNT)
+            snprintf(line, sizeof(line), "Manche %d : %s l'emporte", ev->b,
+                     ev->a == TEAM_RED ? "ROUGE" : "BLEU");
+        else
+            snprintf(line, sizeof(line), "Manche %d : nulle", ev->b);
+        KillfeedPush(line);
+        break;
     case EV_PLAYER_JOIN:
         snprintf(line, sizeof(line), "%s a rejoint la partie", PlayerName(ev->a));
         KillfeedPush(line);
@@ -910,15 +922,16 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
 static void DrawMap(void)
 {
     // Sol de l'arène
+    // Sable : la carte est inspirée de Dust
     DrawPlane((Vector3){0, 0, 0},
               (Vector2){ARENA_HALF * 2, ARENA_HALF * 2},
-              (Color){60, 65, 70, 255});
+              (Color){186, 160, 112, 255});
     // Quadrillage léger tous les 5 m (donne une échelle visuelle)
     for (int i = -(int)ARENA_HALF; i <= (int)ARENA_HALF; i += 5) {
         DrawLine3D((Vector3){(float)i, 0.01f, -ARENA_HALF},
-                   (Vector3){(float)i, 0.01f, ARENA_HALF}, (Color){80, 85, 90, 255});
+                   (Vector3){(float)i, 0.01f, ARENA_HALF}, (Color){170, 146, 100, 255});
         DrawLine3D((Vector3){-ARENA_HALF, 0.01f, (float)i},
-                   (Vector3){ARENA_HALF, 0.01f, (float)i}, (Color){80, 85, 90, 255});
+                   (Vector3){ARENA_HALF, 0.01f, (float)i}, (Color){170, 146, 100, 255});
     }
     // Les boîtes de la map (les mêmes AABB que celles des collisions :
     // ce qu'on voit est exactement ce qui bloque)
@@ -927,8 +940,8 @@ static void DrawMap(void)
         Vector3 center = {(b.min.x + b.max.x) / 2, (b.min.y + b.max.y) / 2,
                           (b.min.z + b.max.z) / 2};
         Vector3 size = {b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z};
-        DrawCubeV(center, size, (Color){110, 115, 125, 255});
-        DrawCubeWiresV(center, size, (Color){40, 42, 48, 255});
+        DrawCubeV(center, size, (Color){212, 190, 142, 255});    // murs et caisses couleur pisé
+        DrawCubeWiresV(center, size, (Color){120, 100, 66, 255});
     }
     // Enseigne reprise du premier jeu : un poussin géant tourne au bout d'un
     // mât planté sur le bloc central, repère visible de toute l'arène.
@@ -1107,13 +1120,31 @@ static void DrawHUD(void)
     SnapshotPlayer *me = (my_id >= 0) ? &snap.players[my_id] : NULL;
     char buf[64];
 
-    // --- Scores d'équipe en haut au centre ---
+    // --- Manches gagnées, numéro de manche et chrono, en haut au centre ---
     snprintf(buf, sizeof(buf), "%d", snap.score[TEAM_RED]);
-    DrawRectangle(UIW / 2 - 90, 12, 70, 34, Fade(TeamColor(TEAM_RED), 0.8f));
-    DrawText(buf, UIW / 2 - 90 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
+    DrawRectangle(UIW / 2 - 110, 12, 70, 34, Fade(TeamColor(TEAM_RED), 0.8f));
+    DrawText(buf, UIW / 2 - 110 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
     snprintf(buf, sizeof(buf), "%d", snap.score[TEAM_BLUE]);
-    DrawRectangle(UIW / 2 + 20, 12, 70, 34, Fade(TeamColor(TEAM_BLUE), 0.8f));
-    DrawText(buf, UIW / 2 + 20 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
+    DrawRectangle(UIW / 2 + 40, 12, 70, 34, Fade(TeamColor(TEAM_BLUE), 0.8f));
+    DrawText(buf, UIW / 2 + 40 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
+    {
+        int t = (int)(snap.round_time + 0.999f);
+        if (snap.round_phase == ROUND_PLAY) snprintf(buf, sizeof(buf), "%d:%02d", t / 60, t % 60);
+        else snprintf(buf, sizeof(buf), "--:--");
+        DrawRectangle(UIW / 2 - 36, 12, 72, 34, Fade(BLACK, 0.55f));
+        DrawText(buf, UIW / 2 - MeasureText(buf, 22) / 2, 19, 22, RAYWHITE);
+        snprintf(buf, sizeof(buf), "MANCHE %d", snap.round);
+        DrawText(buf, UIW / 2 - MeasureText(buf, 14) / 2, 50, 14, LIGHTGRAY);
+        // Survivants : un point par membre vivant sous chaque score
+        int ar = 0, ab = 0;
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            SnapshotPlayer *sp = &snap.players[i];
+            if (!sp->active || !sp->alive) continue;
+            if (sp->team == TEAM_RED) ar++; else ab++;
+        }
+        for (int i = 0; i < ar && i < 8; i++) DrawCircle(UIW / 2 - 104 + i * 9, 54, 3, TeamColor(TEAM_RED));
+        for (int i = 0; i < ab && i < 8; i++) DrawCircle(UIW / 2 + 104 - i * 9, 54, 3, TeamColor(TEAM_BLUE));
+    }
 
     // --- Vie et stats perso en bas à gauche ---
     if (me && me->active) {
@@ -1144,12 +1175,30 @@ static void DrawHUD(void)
         y += 22;
     }
 
-    // --- Écran de mort ---
-    if (me && me->active && !me->alive && !snap.match_over) {
+    // --- Éliminé : on attend la fin de la manche (pas de respawn) ---
+    if (me && me->active && !me->alive && !snap.match_over && snap.round_phase != ROUND_END) {
         DrawRectangle(0, 0, UIW, UIH, Fade(BLACK, 0.5f));
-        const char *msg = "Vous êtes mort — respawn imminent...";
-        DrawText(msg, UIW / 2 - MeasureText(msg, 30) / 2,
-                 UIH / 2 - 15, 30, RED);
+        const char *msg = "Éliminé — en attente de la prochaine manche";
+        DrawText(msg, UIW / 2 - MeasureText(msg, 30) / 2, UIH / 2 - 15, 30, RED);
+    }
+
+    // --- Fin de manche, ou attente d'une équipe adverse ---
+    if (!snap.match_over && snap.round_phase == ROUND_END) {
+        DrawRectangle(0, 0, UIW, UIH, Fade(BLACK, 0.45f));
+        Color c = RAYWHITE;
+        if (snap.round_winner < TEAM_COUNT) {
+            snprintf(buf, sizeof(buf), "MANCHE %d : %s L'EMPORTE", snap.round,
+                     snap.round_winner == TEAM_RED ? "ROUGE" : "BLEU");
+            c = TeamColor(snap.round_winner);
+        } else {
+            snprintf(buf, sizeof(buf), "MANCHE %d : NULLE", snap.round);
+        }
+        DrawText(buf, UIW / 2 - MeasureText(buf, 36) / 2, UIH / 2 - 30, 36, c);
+        snprintf(buf, sizeof(buf), "manche suivante dans %d s", (int)(snap.round_time + 0.999f));
+        DrawText(buf, UIW / 2 - MeasureText(buf, 20) / 2, UIH / 2 + 20, 20, LIGHTGRAY);
+    } else if (!snap.match_over && snap.round_phase == ROUND_WAIT) {
+        const char *msg = "En attente d'une équipe adverse...";
+        DrawText(msg, UIW / 2 - MeasureText(msg, 24) / 2, UIH / 2 - 12, 24, LIGHTGRAY);
     }
 
     // --- Fin de match ---
@@ -1245,8 +1294,11 @@ static bool MobileConnectScreen(char *ip, int cap, const char *name)
             double now = GetTime();
             if (now - last_log >= 1.0) {
                 last_log = now;
-                TraceLog(LOG_INFO, "TACTILE: etat touches=%d souris=%d image=%.0f",
-                         touches, IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1 : 0, now);
+                // ecran : la taille que LE JEU voit (c'est d'elle que depend
+                // la geometrie du pave) — le test en CI s'y cale.
+                TraceLog(LOG_INFO, "TACTILE: etat touches=%d souris=%d ecran=%dx%d t=%.0f",
+                         touches, IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1 : 0,
+                         GetScreenWidth(), GetScreenHeight(), now);
             }
         }
         if (down) {

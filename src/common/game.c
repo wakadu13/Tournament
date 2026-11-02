@@ -4,6 +4,18 @@
 #include "game.h"
 
 // Arène : 4 murs d'enceinte + obstacles symétriques (couverture)
+// Carte inspirée de Dust (Counter-Strike), ramenée à une arène de 60 x 60 m
+// et à des boîtes alignées sur les axes. Les T (bleus) partent au sud, les
+// CT (rouges) au nord. Trois chemins les relient :
+//   - MID, au centre : deux piliers « double doors » et le pilier central
+//     qui porte l'enseigne, avec un passage de chaque côté ;
+//   - LONG A, à l'est : un couloir de 10 m longé d'un mur, qui débouche au
+//     nord sur le site A (nord-est) et ses caisses ;
+//   - les TUNNELS B, à l'ouest : un couloir étroit et COUVERT (le toit, à
+//     3,2 m, ne gêne pas le passage mais bloque les tirs en cloche) qui
+//     débouche sur le site B (nord-ouest).
+// Les voies restent assez ouvertes pour que les bots, qui marchent droit
+// et contournent grossièrement, s'y retrouvent.
 const Box MAP_BOXES[MAP_BOX_COUNT] = {
     // Murs d'enceinte (hauteur 4 m)
     {{-ARENA_HALF, 0, -ARENA_HALF - 1}, { ARENA_HALF, 4, -ARENA_HALF}},  // nord
@@ -11,29 +23,42 @@ const Box MAP_BOXES[MAP_BOX_COUNT] = {
     {{-ARENA_HALF - 1, 0, -ARENA_HALF}, {-ARENA_HALF, 4,  ARENA_HALF}},  // ouest
     {{ ARENA_HALF, 0, -ARENA_HALF},     { ARENA_HALF + 1, 4, ARENA_HALF}}, // est
 
-    // Bloc central
-    {{-3, 0, -3}, {3, 3, 3}},
+    // MID : les « double doors » (deux piliers) et le pilier de l'enseigne
+    {{-8, 0, -1}, {-4, 3, 1}},
+    {{ 4, 0, -1}, { 8, 3, 1}},
+    {{-1.5f, 0, -1.5f}, {1.5f, 3, 1.5f}},
 
-    // Couvertures côté rouge (z négatif)
-    {{-12, 0, -14}, {-8, 2, -10}},
-    {{  8, 0, -14}, { 12, 2, -10}},
-    {{ -2, 0, -20}, {  2, 1.2f, -18}},
+    // LONG A (est) : le mur qui ferme le couloir côté mid
+    {{16, 0, -4}, {18, 3, 18}},
 
-    // Couvertures côté bleu (z positif)
-    {{-12, 0, 10}, {-8, 2, 14}},
-    {{  8, 0, 10}, { 12, 2, 14}},
-    {{ -2, 0, 18}, {  2, 1.2f, 20}},
+    // TUNNELS B (ouest) : le mur côté mid, et le toit du tunnel
+    {{-18, 0, -4}, {-16, 3, 18}},
+    {{-28, 3.2f, 0}, {-19, 4, 16}},
 
-    // Couloirs latéraux
-    {{-22, 0, -4}, {-18, 2.5f, 4}},
-    {{ 18, 0, -4}, { 22, 2.5f, 4}},
+    // Site A (nord-est) : caisses
+    {{18, 0, -18}, {21, 1.5f, -15}},
+    {{22, 0, -14}, {24, 2, -12}},
+    {{12, 0, -22}, {15, 2, -19}},
+
+    // Site B (nord-ouest) : caisses
+    {{-22, 0, -20}, {-19, 1.5f, -17}},
+    {{-16, 0, -14}, {-13, 2, -11}},
+    {{-24, 0, -12}, {-21, 2, -10}},
+
+    // Spawn T (sud) et mid : couvertures basses
+    {{-8, 0, 22}, {-5, 1.2f, 24}},
+    {{ 6, 0, 20}, { 9, 2, 23}},
+    {{-10, 0, 8}, {-8, 1.2f, 12}},
+    {{ 9, 0, 6}, {11, 1.2f, 9}},
 };
 
+// Spawns : CT (rouges) au nord, T (bleus) au sud, groupés au centre de
+// leur bord — les trois voies s'ouvrent devant eux.
 const V3 TEAM_SPAWNS[TEAM_COUNT][SPAWNS_PER_TEAM] = {
-    // Rouge : au nord (z négatif)
-    {{-15, 0, -26}, {-5, 0, -26}, {5, 0, -26}, {15, 0, -26}},
-    // Bleu : au sud (z positif)
-    {{-15, 0,  26}, {-5, 0,  26}, {5, 0,  26}, {15, 0,  26}},
+    // Rouge / CT : au nord (z négatif)
+    {{-6, 0, -26}, {-2, 0, -26}, {2, 0, -26}, {6, 0, -26}},
+    // Bleu / T : au sud (z positif)
+    {{-6, 0,  26}, {-2, 0,  26}, {2, 0,  26}, {6, 0,  26}},
 };
 
 Box PlayerBox(V3 feet)
