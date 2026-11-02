@@ -26,16 +26,16 @@
  *     Le réticule s'écarte à l'écran pour la montrer.
  */
 
+// platform.h EN PREMIER : sous Windows, winsock2.h tire windows.h, qui
+// declare Rectangle, CloseWindow, ShowCursor et DrawText — les memes noms
+// que raylib. platform.h ecarte les en-tetes fautifs, mais seulement si
+// ses macros sont posees AVANT raylib.h.
+#include "../common/platform.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 #include <math.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include "raylib.h"
 #include "raymath.h"   // matrices et vecteurs (viewmodel de l'arme)
@@ -44,6 +44,7 @@
 #include "../common/protocol.h"
 #include "../common/game.h"
 #include "models.h"   // modèles 3D des personnages (soldat / poussin zombie)
+#include "touch.h"    // commandes tactiles (mobile) et structure PlayerInput
 
 //----------------------------------------------------------------------------------
 // Réglages de la vue FPS
@@ -52,6 +53,49 @@
 #define SCREEN_H 720
 
 #define MOUSE_SENSITIVITY 0.0025f  // radians par pixel de souris
+
+// Interface mobile : écran de connexion au doigt et commandes tactiles.
+// Même interrupteur que TOUCH_ENABLED dans touch.c, pour que les deux
+// fichiers soient toujours d'accord. -DTOUCH_CONTROLS=1 permet de la
+// mettre au point sur PC, sans téléphone.
+#if defined(PLATFORM_ANDROID) || defined(TOUCH_CONTROLS)
+    #define MOBILE_UI 1
+#else
+    #define MOBILE_UI 0
+#endif
+
+//----------------------------------------------------------------------------------
+// Échelle de l'interface
+//----------------------------------------------------------------------------------
+// Le HUD est dessiné en UNITÉS D'INTERFACE : 720 de haut, largeur selon le
+// ratio de l'écran. Sur PC la fenêtre fait exactement SCREEN_W x SCREEN_H et
+// une unité vaut un pixel ; sur un téléphone l'écran est bien plus grand et
+// plus large, et BeginMode2D met tout à l'échelle d'un coup. Sans ça le HUD
+// se tasserait dans un coin de l'écran.
+#define UI_H 720                      // hauteur de référence
+static float ui_scale = 1.0f;         // pixels réels par unité d'interface
+static float ui_w = (float)SCREEN_W;  // largeur de l'écran EN UNITÉS
+static float ui_h = (float)UI_H;
+#define UIW ((int)ui_w)
+#define UIH ((int)ui_h)
+
+// À appeler une fois par image : l'écran d'un mobile peut tourner.
+static void UiUpdate(void)
+{
+    int rw = GetScreenWidth(), rh = GetScreenHeight();
+    if (rw < 1 || rh < 1) { rw = SCREEN_W; rh = SCREEN_H; }
+    ui_scale = (float)rh / (float)UI_H;   // on cale sur la hauteur
+    ui_h = (float)UI_H;
+    ui_w = (float)rw / ui_scale;          // la largeur suit le ratio de l'écran
+}
+
+// Caméra 2D qui applique cette échelle à tout le dessin de l'interface
+static Camera2D UiCamera(void)
+{
+    Camera2D c = {0};
+    c.zoom = ui_scale;
+    return c;
+}
 
 // Champ de vision (degrés) selon la situation. La valeur réelle rejoint
 // la cible en douceur à chaque frame (pas de saut brutal).
@@ -73,7 +117,7 @@
 //----------------------------------------------------------------------------------
 // État réseau
 //----------------------------------------------------------------------------------
-static int                sock_fd = -1;     // socket UDP (non bloquant)
+static socket_t           sock_fd = SOCKET_NONE;   // socket UDP (non bloquant)
 static struct sockaddr_in server_addr;      // adresse du serveur
 static int                my_id = -1;       // notre numéro de slot côté serveur
 static Team               my_team = TEAM_RED;
@@ -179,9 +223,10 @@ static void TracerAdd(Vector3 from, Vector3 to)
 // réessaie toutes les 0,5 s, 10 fois maximum).
 static bool NetConnect(const char *ip, const char *name)
 {
+    if (!PlatformNetInit()) return false;
     sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) return false;
-    fcntl(sock_fd, F_SETFL, O_NONBLOCK);   // recvfrom ne bloquera jamais
+    if (SocketFailed(sock_fd)) return false;
+    SocketSetNonBlocking(sock_fd);   // recvfrom ne bloquera jamais
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -204,8 +249,8 @@ static bool NetConnect(const char *ip, const char *name)
         double deadline = GetTime() + 0.5;
         while (GetTime() < deadline) {
             uint8_t buf[2048];
-            ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
-            if (n >= (ssize_t)sizeof(PacketAccept) && buf[0] == PKT_SV_ACCEPT) {
+            sock_ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
+            if (n >= (sock_ssize_t)sizeof(PacketAccept) && buf[0] == PKT_SV_ACCEPT) {
                 PacketAccept *acc = (PacketAccept *)buf;
                 my_id = acc->player_id;       // le serveur nous donne notre slot
                 my_team = (Team)acc->team;    // et notre équipe (auto-équilibrage)
@@ -214,12 +259,12 @@ static bool NetConnect(const char *ip, const char *name)
                        my_team == TEAM_RED ? "ROUGE" : "BLEUE");
                 return true;
             }
-            if (n >= (ssize_t)sizeof(PacketHeader) && buf[0] == PKT_SV_REJECT) {
+            if (n >= (sock_ssize_t)sizeof(PacketHeader) && buf[0] == PKT_SV_REJECT) {
                 PacketReject *rej = (PacketReject *)buf;
                 printf("Connexion refusée : %.32s\n", rej->reason);
                 return false;
             }
-            usleep(10000);
+            PlatformSleepMs(10);
         }
         printf("Connexion au serveur %s... (%d/10)\n", ip, attempt + 1);
     }
@@ -311,11 +356,11 @@ static void NetReceive(void)
 {
     for (;;) {
         uint8_t buf[4096];
-        ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
+        sock_ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
         if (n <= 0) break;         // plus rien à lire
         last_server_msg = GetTime();
 
-        if (buf[0] == PKT_SV_SNAPSHOT && n >= (ssize_t)sizeof(PacketSnapshot)) {
+        if (buf[0] == PKT_SV_SNAPSHOT && n >= (sock_ssize_t)sizeof(PacketSnapshot)) {
             memcpy(&snap, buf, sizeof(snap));
 
             // Le serveur fait autorité sur notre vie. Quand son compteur
@@ -338,7 +383,7 @@ static void NetReceive(void)
                 if (me->health < last_health) damage_flash_timer = 0.25f;
                 last_health = me->health;
             }
-        } else if (buf[0] == PKT_SV_EVENT && n >= (ssize_t)sizeof(PacketEvent)) {
+        } else if (buf[0] == PKT_SV_EVENT && n >= (sock_ssize_t)sizeof(PacketEvent)) {
             HandleEvent((const PacketEvent *)buf);
         }
     }
@@ -490,30 +535,46 @@ static void Shoot(void)
 //----------------------------------------------------------------------------------
 static void UpdateLocalPlayer(float dt)
 {
+    // Les commandes sont rassemblées ici, d'où qu'elles viennent : clavier
+    // et souris sur PC, doigts sur mobile. Le reste de la fonction ne sait
+    // plus sur quelle machine il tourne.
+    PlayerInput in = {0};
+
     // --- Souris : rotation de la vue (moins sensible en visant) ---
     float sens = MOUSE_SENSITIVITY * (1.0f - ads * 0.35f);
     Vector2 md = GetMouseDelta();
-    my_yaw -= md.x * sens;
-    my_pitch -= md.y * sens;
-    // Pitch limité à ~±86° : impossible de "passer par-dessus" la verticale
-    my_pitch = Clamp(my_pitch, -1.5f, 1.5f);
+    in.look.x = -md.x * sens;
+    in.look.y = -md.y * sens;
 
     // --- Clavier : direction voulue. KEY_* correspond à la POSITION des
     // touches (comme un QWERTY) : WASD marche donc en ZQSD sur un clavier
     // AZERTY. On accepte aussi Z/Q au cas où le clavier serait mappé. ---
-    Vector2 move = {0};
-    if (IsKeyDown(KEY_W) || IsKeyDown(KEY_Z)) move.y += 1;   // avancer
-    if (IsKeyDown(KEY_S)) move.y -= 1;                       // reculer
-    if (IsKeyDown(KEY_D)) move.x += 1;                       // droite
-    if (IsKeyDown(KEY_A) || IsKeyDown(KEY_Q)) move.x -= 1;   // gauche
+    if (IsKeyDown(KEY_W) || IsKeyDown(KEY_Z)) in.move.y += 1;   // avancer
+    if (IsKeyDown(KEY_S)) in.move.y -= 1;                       // reculer
+    if (IsKeyDown(KEY_D)) in.move.x += 1;                       // droite
+    if (IsKeyDown(KEY_A) || IsKeyDown(KEY_Q)) in.move.x -= 1;   // gauche
+    in.fire = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    in.aim  = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+    in.jump = IsKeyDown(KEY_SPACE);
+    in.sprint = IsKeyDown(KEY_LEFT_SHIFT);
+
+    // --- Doigts : s'ajoutent aux commandes ci-dessus (sans effet sur PC) ---
+    TouchApply(&in, ads);
+
     // En diagonale la longueur vaudrait ~1.41 : on la ramène à 1 pour ne
     // pas se déplacer plus vite en biais.
-    if (Vector2Length(move) > 1.0f) move = Vector2Normalize(move);
+    if (Vector2Length(in.move) > 1.0f) in.move = Vector2Normalize(in.move);
 
-    bool firing = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
-    bool aiming = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
-    // Sprint : Maj + en avançant, incompatible avec viser/tirer
-    sprinting = IsKeyDown(KEY_LEFT_SHIFT) && move.y > 0.3f && !aiming && !firing;
+    my_yaw += in.look.x;
+    my_pitch += in.look.y;
+    // Pitch limité à ~±86° : impossible de "passer par-dessus" la verticale
+    my_pitch = Clamp(my_pitch, -1.5f, 1.5f);
+
+    Vector2 move = in.move;
+    bool firing = in.fire;
+    bool aiming = in.aim;
+    // Sprint : en avançant, incompatible avec viser/tirer
+    sprinting = in.sprint && move.y > 0.3f && !aiming && !firing;
 
     // --- Déplacement : vitesse voulue puis accélération progressive.
     // "devant" et "droite" sont calculés à plat (sans le pitch) : on se
@@ -534,7 +595,7 @@ static void UpdateLocalPlayer(float dt)
     my_vel.z += (wish.z - my_vel.z) * fminf(1.0f, dt * accel);
 
     // Saut : seulement au sol
-    if (IsKeyDown(KEY_SPACE) && on_ground) my_vel_y = PLAYER_JUMP_SPEED;
+    if (in.jump && on_ground) my_vel_y = PLAYER_JUMP_SPEED;
 
     // Collisions et gravité (code partagé avec le serveur/bot)
     MovePlayer(&my_pos, my_vel, &my_vel_y, dt, &on_ground);
@@ -553,8 +614,8 @@ static void UpdateLocalPlayer(float dt)
     sprint_t += ((sprinting ? 1.0f : 0.0f) - sprint_t) * fminf(1.0f, dt * 10.0f);
 
     // --- Sway : l'arme traîne légèrement derrière la souris ---
-    sway.x += (-md.x * sens * 0.18f - sway.x) * fminf(1.0f, dt * 8.0f);
-    sway.y += (md.y * sens * 0.18f - sway.y) * fminf(1.0f, dt * 8.0f);
+    sway.x += (in.look.x * 0.18f - sway.x) * fminf(1.0f, dt * 8.0f);
+    sway.y += (-in.look.y * 0.18f - sway.y) * fminf(1.0f, dt * 8.0f);
     sway.x = Clamp(sway.x, -0.03f, 0.03f);
     sway.y = Clamp(sway.y, -0.03f, 0.03f);
 }
@@ -860,7 +921,11 @@ static void DrawNameTags(Camera3D cam)
         Vector3 head = {display_pos[i].x, display_pos[i].y + PLAYER_HEIGHT + 0.3f,
                         display_pos[i].z};
         Vector2 sc = GetWorldToScreen(head, cam);
-        if (sc.x < 0 || sc.x > SCREEN_W || sc.y < 0 || sc.y > SCREEN_H) continue;
+        // GetWorldToScreen rend des pixels RÉELS : on repasse en unités
+        // d'interface, puisque le pseudo est dessiné dans la caméra 2D.
+        sc.x /= ui_scale;
+        sc.y /= ui_scale;
+        if (sc.x < 0 || sc.x > ui_w || sc.y < 0 || sc.y > ui_h) continue;
         // GetWorldToScreen projette aussi ce qui est DERRIÈRE la caméra :
         // on vérifie que le joueur est bien devant nous
         V3 look = LookDir();
@@ -880,7 +945,7 @@ static void DrawCrosshair(void)
     if (ads > 0.7f) return;        // en visée : le viseur de l'arme suffit
     Color c = (hit_marker_timer > 0) ? RED : RAYWHITE;
     c = Fade(c, 1.0f - ads);       // s'efface pendant la transition de visée
-    int cx = SCREEN_W / 2, cy = SCREEN_H / 2;
+    int cx = UIW / 2, cy = UIH / 2;
     // Écart en pixels proportionnel à la dispersion (~800 px par radian)
     int gap = 4 + (int)(WeaponSpread() * 800.0f);
     DrawLine(cx - gap - 6, cy, cx - gap, cy, c);
@@ -896,29 +961,29 @@ static void DrawHUD(void)
 
     // --- Scores d'équipe en haut au centre ---
     snprintf(buf, sizeof(buf), "%d", snap.score[TEAM_RED]);
-    DrawRectangle(SCREEN_W / 2 - 90, 12, 70, 34, Fade(TeamColor(TEAM_RED), 0.8f));
-    DrawText(buf, SCREEN_W / 2 - 90 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
+    DrawRectangle(UIW / 2 - 90, 12, 70, 34, Fade(TeamColor(TEAM_RED), 0.8f));
+    DrawText(buf, UIW / 2 - 90 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
     snprintf(buf, sizeof(buf), "%d", snap.score[TEAM_BLUE]);
-    DrawRectangle(SCREEN_W / 2 + 20, 12, 70, 34, Fade(TeamColor(TEAM_BLUE), 0.8f));
-    DrawText(buf, SCREEN_W / 2 + 20 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
+    DrawRectangle(UIW / 2 + 20, 12, 70, 34, Fade(TeamColor(TEAM_BLUE), 0.8f));
+    DrawText(buf, UIW / 2 + 20 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
 
     // --- Vie et stats perso en bas à gauche ---
     if (me && me->active) {
         int hp = me->health < 0 ? 0 : me->health;
-        DrawRectangle(28, SCREEN_H - 56, 204, 26, Fade(BLACK, 0.5f));
+        DrawRectangle(28, UIH - 56, 204, 26, Fade(BLACK, 0.5f));
         Color hc = hp > 50 ? GREEN : (hp > 25 ? ORANGE : RED);
-        DrawRectangle(30, SCREEN_H - 54, 2 * hp, 22, hc);   // 2 px par PV
+        DrawRectangle(30, UIH - 54, 2 * hp, 22, hc);   // 2 px par PV
         snprintf(buf, sizeof(buf), "%d PV", hp);
-        DrawText(buf, 36, SCREEN_H - 52, 18, WHITE);
+        DrawText(buf, 36, UIH - 52, 18, WHITE);
         snprintf(buf, sizeof(buf), "K %d / D %d", me->kills, me->deaths);
-        DrawText(buf, 30, SCREEN_H - 82, 18, RAYWHITE);
+        DrawText(buf, 30, UIH - 82, 18, RAYWHITE);
     }
 
     DrawCrosshair();
 
     // --- Voile rouge quand on vient d'être touché ---
     if (damage_flash_timer > 0)
-        DrawRectangle(0, 0, SCREEN_W, SCREEN_H,
+        DrawRectangle(0, 0, UIW, UIH,
                       Fade(RED, 0.25f * damage_flash_timer / 0.25f));
 
     // --- Killfeed en haut à droite ---
@@ -927,30 +992,30 @@ static void DrawHUD(void)
         if (killfeed[i].ttl <= 0) continue;
         float a = killfeed[i].ttl > 1.0f ? 1.0f : killfeed[i].ttl;  // fondu en fin de vie
         int w = MeasureText(killfeed[i].text, 16);
-        DrawText(killfeed[i].text, SCREEN_W - w - 20, y, 16, Fade(RAYWHITE, a));
+        DrawText(killfeed[i].text, UIW - w - 20, y, 16, Fade(RAYWHITE, a));
         y += 22;
     }
 
     // --- Écran de mort ---
     if (me && me->active && !me->alive && !snap.match_over) {
-        DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade(BLACK, 0.5f));
+        DrawRectangle(0, 0, UIW, UIH, Fade(BLACK, 0.5f));
         const char *msg = "Vous êtes mort — respawn imminent...";
-        DrawText(msg, SCREEN_W / 2 - MeasureText(msg, 30) / 2,
-                 SCREEN_H / 2 - 15, 30, RED);
+        DrawText(msg, UIW / 2 - MeasureText(msg, 30) / 2,
+                 UIH / 2 - 15, 30, RED);
     }
 
     // --- Fin de match ---
     if (snap.match_over) {
-        DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade(BLACK, 0.6f));
+        DrawRectangle(0, 0, UIW, UIH, Fade(BLACK, 0.6f));
         const char *msg = (snap.winner == TEAM_RED)
             ? "VICTOIRE DE L'ÉQUIPE ROUGE" : "VICTOIRE DE L'ÉQUIPE BLEUE";
-        DrawText(msg, SCREEN_W / 2 - MeasureText(msg, 40) / 2,
-                 SCREEN_H / 2 - 20, 40, TeamColor(snap.winner));
+        DrawText(msg, UIW / 2 - MeasureText(msg, 40) / 2,
+                 UIH / 2 - 20, 40, TeamColor(snap.winner));
     }
 
     // --- Tableau des scores (maintenu avec Tab) ---
     if (IsKeyDown(KEY_TAB)) {
-        int px = SCREEN_W / 2 - 250, py = 100;
+        int px = UIW / 2 - 250, py = 100;
         DrawRectangle(px, py, 500, 400, Fade(BLACK, 0.75f));
         DrawText("ROUGE", px + 20, py + 15, 22, TeamColor(TEAM_RED));
         DrawText("BLEU", px + 270, py + 15, 22, TeamColor(TEAM_BLUE));
@@ -971,34 +1036,152 @@ static void DrawHUD(void)
     // --- Alerte si le serveur ne répond plus depuis 2 s ---
     if (GetTime() - last_server_msg > 2.0) {
         const char *msg = "Connexion au serveur perdue...";
-        DrawText(msg, SCREEN_W / 2 - MeasureText(msg, 20) / 2, 60, 20, ORANGE);
+        DrawText(msg, UIW / 2 - MeasureText(msg, 20) / 2, 60, 20, ORANGE);
     }
 }
 
 //----------------------------------------------------------------------------------
 // Boucle principale
 //----------------------------------------------------------------------------------
+#if MOBILE_UI
+//----------------------------------------------------------------------------------
+// Écran de connexion du mobile
+//----------------------------------------------------------------------------------
+// Un téléphone n'a pas de ligne de commande : impossible de passer l'adresse
+// du serveur en argument. On ouvre donc la fenêtre d'abord et on demande
+// l'adresse au doigt, sur un pavé numérique (chiffres, point, effacement).
+//
+// raylib fait passer le tactile pour la souris sur Android : le même code
+// marche sur PC, ce qui permet de régler cet écran sans téléphone.
+//
+// Remplit ip (cap octets) et renvoie true quand la connexion est établie,
+// false si le joueur quitte l'application.
+static bool MobileConnectScreen(char *ip, int cap, const char *name)
+{
+    static const char *keys[12] = { "1","2","3","4","5","6","7","8","9",".","0","<" };
+    const Color BG = {18, 20, 26, 255};
+    char msg[80] = "";
+
+    for (;;) {
+        if (WindowShouldClose()) return false;
+        UiUpdate();
+
+        // Disposition, en unités d'interface : pavé 3 x 4 centré
+        float bw = 112, bh = 78, gap = 12;
+        float gx = ui_w / 2 - (3 * bw + 2 * gap) / 2, gy = 236;
+        Rectangle connect = { ui_w / 2 - 140, gy + 4 * (bh + gap) + 14, 280, 78 };
+
+        // --- Un appui : on teste les boutons sous le doigt ---
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            Vector2 m = GetMousePosition();
+            m.x /= ui_scale;      // les clics arrivent en pixels réels
+            m.y /= ui_scale;
+            for (int i = 0; i < 12; i++) {
+                Rectangle r = { gx + (i % 3) * (bw + gap), gy + (i / 3) * (bh + gap), bw, bh };
+                if (!CheckCollisionPointRec(m, r)) continue;
+                size_t len = strlen(ip);
+                if (keys[i][0] == '<') { if (len > 0) ip[len - 1] = '\0'; }
+                else if (len + 1 < (size_t)cap) { ip[len] = keys[i][0]; ip[len + 1] = '\0'; }
+            }
+            if (CheckCollisionPointRec(m, connect) && ip[0] != '\0') {
+                // NetConnect bloque jusqu'à 5 s (10 tentatives) : on affiche
+                // d'abord une image, sinon l'écran semble figé.
+                BeginDrawing();
+                ClearBackground(BG);
+                BeginMode2D(UiCamera());
+                const char *t = "Connexion...";
+                DrawText(t, (int)(ui_w / 2) - MeasureText(t, 36) / 2, 320, 36, RAYWHITE);
+                EndMode2D();
+                EndDrawing();
+
+                if (NetConnect(ip, name)) return true;
+                snprintf(msg, sizeof(msg), "Serveur injoignable : %s", ip);
+            }
+        }
+
+        // --- Dessin ---
+        BeginDrawing();
+        ClearBackground(BG);
+        BeginMode2D(UiCamera());
+
+        const char *title = "EMA TOURNAMENT";
+        DrawText(title, (int)(ui_w / 2) - MeasureText(title, 44) / 2, 52, 44, RAYWHITE);
+        const char *sub2 = "Adresse du serveur";
+        DrawText(sub2, (int)(ui_w / 2) - MeasureText(sub2, 20) / 2, 112, 20, GRAY);
+
+        // Champ de saisie
+        Rectangle field = { ui_w / 2 - 200, 150, 400, 62 };
+        DrawRectangleRec(field, Fade(BLACK, 0.5f));
+        DrawRectangleLinesEx(field, 2, Fade(RAYWHITE, 0.4f));
+        const char *shown = (ip[0] != '\0') ? ip : "___.___.___.___";
+        DrawText(shown, (int)(field.x + field.width / 2) - MeasureText(shown, 34) / 2,
+                 (int)field.y + 14, 34, ip[0] ? RAYWHITE : DARKGRAY);
+
+        // Pavé
+        for (int i = 0; i < 12; i++) {
+            Rectangle r = { gx + (i % 3) * (bw + gap), gy + (i / 3) * (bh + gap), bw, bh };
+            DrawRectangleRec(r, Fade(RAYWHITE, 0.12f));
+            DrawRectangleLinesEx(r, 1, Fade(RAYWHITE, 0.3f));
+            DrawText(keys[i], (int)(r.x + r.width / 2) - MeasureText(keys[i], 32) / 2,
+                     (int)(r.y + r.height / 2) - 16, 32, RAYWHITE);
+        }
+
+        // Bouton CONNECTER
+        bool ready = (ip[0] != '\0');
+        DrawRectangleRec(connect, Fade(ready ? (Color){70, 160, 90, 255} : GRAY, 0.8f));
+        DrawRectangleLinesEx(connect, 2, Fade(RAYWHITE, 0.5f));
+        const char *cl = "CONNECTER";
+        DrawText(cl, (int)(connect.x + connect.width / 2) - MeasureText(cl, 30) / 2,
+                 (int)(connect.y + 24), 30, RAYWHITE);
+
+        if (msg[0] != '\0')
+            DrawText(msg, (int)(ui_w / 2) - MeasureText(msg, 20) / 2,
+                     (int)(connect.y + connect.height + 16), 20, (Color){235, 90, 70, 255});
+
+        EndMode2D();
+        EndDrawing();
+    }
+}
+#endif  // MOBILE_UI
+
 int main(int argc, char **argv)
 {
-    const char *ip = (argc > 1) ? argv[1] : "127.0.0.1";
+#if !MOBILE_UI
+    const char *ip = (argc > 1) ? argv[1] : "127.0.0.1";   // serveur à joindre
+#endif
     const char *name = (argc > 2) ? argv[2] : "Joueur";
 
-    printf("FPS TDM — connexion à %s en tant que \"%s\"\n", ip, name);
     SetTraceLogLevel(LOG_WARNING);   // raylib moins bavard dans la console
 
-    // On se connecte AVANT d'ouvrir la fenêtre : inutile de l'ouvrir si
+#if MOBILE_UI
+    // Mobile : la fenêtre d'abord (il faut un écran pour demander l'adresse
+    // du serveur), et pas de capture du curseur — on a besoin du doigt.
+    InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament");
+    SetTargetFPS(60);                // 60 Hz : suffisant, et ménage la batterie
+    UiUpdate();
+    char ip_typed[64] = "";
+    if (!MobileConnectScreen(ip_typed, (int)sizeof(ip_typed), name)) {
+        CloseWindow();
+        return 0;
+    }
+#else
+    printf("FPS TDM — connexion à %s en tant que \"%s\"\n", ip, name);
+    // PC : on se connecte AVANT d'ouvrir la fenêtre, inutile de l'ouvrir si
     // le serveur est injoignable
     if (!NetConnect(ip, name)) return 1;
 
     InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament — TDM");
     SetTargetFPS(144);
     DisableCursor();   // capture la souris (visée FPS)
+#endif
 
     ModelsInit();   // crée les maillages des personnages (après InitWindow)
     // Un état d'animation par joueur, décalé par son numéro de slot : deux
     // poussins ne clignent pas des yeux au même instant et ne s'ébrouent
     // pas ensemble.
     for (int i = 0; i < MAX_PLAYERS; i++) CharAnimInit(&anim[i], i + 1);
+    UiUpdate();
+    TouchReset();
 
     // Position de départ : premier spawn de notre équipe. Le premier
     // snapshot du serveur corrigera si besoin.
@@ -1016,6 +1199,8 @@ int main(int argc, char **argv)
         float dt = GetFrameTime();
         if (dt > 0.05f) dt = 0.05f;
 
+        UiUpdate();                         // l'écran a pu tourner (mobile)
+        TouchUpdate(ui_scale, ui_w, ui_h);  // doigts posés cette image
         NetReceive();                       // snapshots + événements
 
         if (my_alive && !snap.match_over) UpdateLocalPlayer(dt);
@@ -1039,15 +1224,21 @@ int main(int argc, char **argv)
 
         DrawViewModel();        // 2) l'arme, par-dessus la scène
 
-        DrawNameTags(cam);      // 3) l'interface 2D
+        // 3) l'interface, en unités d'interface : la caméra 2D la met à
+        // l'échelle de l'écran réel (indispensable sur mobile).
+        BeginMode2D(UiCamera());
+        DrawNameTags(cam);
         DrawHUD();
-        DrawFPS(SCREEN_W - 90, SCREEN_H - 30);
+        TouchDraw();            // joystick et boutons (mobile seulement)
+        DrawFPS(UIW - 90, UIH - 30);
+        EndMode2D();
         EndDrawing();
     }
 
     NetSendDisconnect();
     ModelsClose();     // libère les maillages (avant CloseWindow)
     CloseWindow();
-    close(sock_fd);
+    SocketClose(sock_fd);
+    PlatformNetShutdown();
     return 0;
 }

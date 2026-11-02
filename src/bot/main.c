@@ -18,18 +18,13 @@
  * l'origine de chaque attaque, applique les dégâts et gère les respawns.
  */
 
+// platform.h d'abord : sockets, horloge monotone et sleep, quel que soit
+// le systeme (voir src/common/platform.h).
+#include "../common/platform.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
-#include <math.h>
-#include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <time.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include "../common/protocol.h"
 #include "../common/game.h"
@@ -45,7 +40,7 @@
 //----------------------------------------------------------------------------------
 // État du bot
 //----------------------------------------------------------------------------------
-static int                sock_fd = -1;
+static socket_t           sock_fd = SOCKET_NONE;
 static struct sockaddr_in server_addr;
 static int                my_id = -1;
 static Team               my_team = TEAM_RED;
@@ -67,12 +62,8 @@ static float stuck_time = 0.0f;    // depuis combien de temps on est coincé
 static float dodge_time = 0.0f;    // temps restant de pas de côté
 static int   dodge_side = 1;       // -1 = gauche, +1 = droite
 
-static double Now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
-}
+// Horloge monotone de la boucle du bot (voir platform.h)
+static double Now(void) { return PlatformNow(); }
 
 //----------------------------------------------------------------------------------
 // Réseau (même logique que le client graphique)
@@ -80,9 +71,10 @@ static double Now(void)
 // Poignée de main : on renvoie PKT_CL_CONNECT jusqu'à l'acceptation
 static bool NetConnect(const char *ip, const char *name)
 {
+    if (!PlatformNetInit()) { printf("pile reseau indisponible\n"); return false; }
     sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) { perror("socket"); return false; }
-    fcntl(sock_fd, F_SETFL, O_NONBLOCK);
+    if (SocketFailed(sock_fd)) { perror("socket"); return false; }
+    SocketSetNonBlocking(sock_fd);
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -105,8 +97,8 @@ static bool NetConnect(const char *ip, const char *name)
         double deadline = Now() + 0.5;
         while (Now() < deadline) {
             uint8_t buf[2048];
-            ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
-            if (n >= (ssize_t)sizeof(PacketAccept) && buf[0] == PKT_SV_ACCEPT) {
+            sock_ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
+            if (n >= (sock_ssize_t)sizeof(PacketAccept) && buf[0] == PKT_SV_ACCEPT) {
                 PacketAccept *acc = (PacketAccept *)buf;
                 my_id = acc->player_id;
                 my_team = (Team)acc->team;
@@ -114,11 +106,11 @@ static bool NetConnect(const char *ip, const char *name)
                        my_team == TEAM_RED ? "ROUGE" : "BLEUE");
                 return true;
             }
-            if (n >= (ssize_t)sizeof(PacketHeader) && buf[0] == PKT_SV_REJECT) {
+            if (n >= (sock_ssize_t)sizeof(PacketHeader) && buf[0] == PKT_SV_REJECT) {
                 printf("[zombie] connexion refusée\n");
                 return false;
             }
-            usleep(10000);
+            PlatformSleepMs(10);
         }
         printf("[zombie] connexion à %s... (%d/10)\n", ip, attempt + 1);
     }
@@ -154,10 +146,10 @@ static void NetReceive(void)
 {
     for (;;) {
         uint8_t buf[4096];
-        ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
+        sock_ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
         if (n <= 0) break;
 
-        if (buf[0] == PKT_SV_SNAPSHOT && n >= (ssize_t)sizeof(PacketSnapshot)) {
+        if (buf[0] == PKT_SV_SNAPSHOT && n >= (sock_ssize_t)sizeof(PacketSnapshot)) {
             memcpy(&snap, buf, sizeof(snap));
             has_snap = true;
 
@@ -317,7 +309,7 @@ int main(int argc, char **argv)
             NetSendState();
         }
 
-        usleep(2000);   // ~2 ms : ne sature pas un cœur de CPU
+        PlatformSleepMs(2);   // ~2 ms : ne sature pas un cœur de CPU
     }
     return 0;
 }

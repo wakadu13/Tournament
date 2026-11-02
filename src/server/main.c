@@ -6,18 +6,13 @@
 // position ; le serveur reste autoritaire sur les tirs, la vie, les
 // kills, les scores et les respawns.
 
+// platform.h d'abord : sockets, horloge monotone et sleep, quel que soit
+// le systeme (voir src/common/platform.h).
+#include "../common/platform.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
-#include <math.h>
-#include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <time.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include "../common/protocol.h"
 #include "../common/game.h"
@@ -46,14 +41,10 @@ static int      team_score[TEAM_COUNT];
 static bool     match_over = false;
 static int      winner = 0;
 static uint32_t tick = 0;
-static int      sock_fd = -1;
+static socket_t sock_fd = SOCKET_NONE;
 
-static double Now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
-}
+// Horloge monotone de la boucle de simulation (voir platform.h)
+static double Now(void) { return PlatformNow(); }
 
 static bool SameAddr(const struct sockaddr_in *a, const struct sockaddr_in *b)
 {
@@ -227,18 +218,18 @@ static void HandleShoot(const PacketShoot *pkt, const struct sockaddr_in *from)
     }
 }
 
-static void HandlePacket(const uint8_t *buf, ssize_t len, const struct sockaddr_in *from)
+static void HandlePacket(const uint8_t *buf, sock_ssize_t len, const struct sockaddr_in *from)
 {
-    if (len < (ssize_t)sizeof(PacketHeader)) return;
+    if (len < (sock_ssize_t)sizeof(PacketHeader)) return;
 
     switch (buf[0]) {
     case PKT_CL_CONNECT:
-        if (len >= (ssize_t)sizeof(PacketConnect))
+        if (len >= (sock_ssize_t)sizeof(PacketConnect))
             HandleConnect((const PacketConnect *)buf, from);
         break;
 
     case PKT_CL_STATE:
-        if (len >= (ssize_t)sizeof(PacketClientState)) {
+        if (len >= (sock_ssize_t)sizeof(PacketClientState)) {
             const PacketClientState *pkt = (const PacketClientState *)buf;
             Player *p = ValidSender(pkt->player_id, from);
             // spawn_count : on rejette les positions datant d'avant le
@@ -254,12 +245,12 @@ static void HandlePacket(const uint8_t *buf, ssize_t len, const struct sockaddr_
         break;
 
     case PKT_CL_SHOOT:
-        if (len >= (ssize_t)sizeof(PacketShoot))
+        if (len >= (sock_ssize_t)sizeof(PacketShoot))
             HandleShoot((const PacketShoot *)buf, from);
         break;
 
     case PKT_CL_DISCONNECT:
-        if (len >= (ssize_t)sizeof(PacketDisconnect)) {
+        if (len >= (sock_ssize_t)sizeof(PacketDisconnect)) {
             const PacketDisconnect *pkt = (const PacketDisconnect *)buf;
             if (ValidSender(pkt->player_id, from))
                 RemovePlayer(pkt->player_id, "déconnexion");
@@ -305,9 +296,10 @@ int main(int argc, char **argv)
     srand((unsigned)time(NULL));
     setvbuf(stdout, NULL, _IOLBF, 0); // logs visibles même redirigés
 
+    if (!PlatformNetInit()) { printf("pile reseau indisponible\n"); return 1; }
     sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) { perror("socket"); return 1; }
-    fcntl(sock_fd, F_SETFL, O_NONBLOCK);
+    if (SocketFailed(sock_fd)) { perror("socket"); return 1; }
+    SocketSetNonBlocking(sock_fd);
 
     struct sockaddr_in bind_addr = {0};
     bind_addr.sin_family = AF_INET;
@@ -330,8 +322,8 @@ int main(int argc, char **argv)
         for (;;) {
             uint8_t buf[2048];
             struct sockaddr_in from;
-            socklen_t from_len = sizeof(from);
-            ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0,
+            sock_len_t from_len = sizeof(from);
+            sock_ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0,
                                  (struct sockaddr *)&from, &from_len);
             if (n <= 0) break;
             HandlePacket(buf, n, &from);
@@ -367,7 +359,7 @@ int main(int argc, char **argv)
             SendSnapshot();
         }
 
-        usleep(1000); // ~1 ms, évite de saturer un cœur
+        PlatformSleepMs(1);   // ~1 ms, évite de saturer un cœur
     }
     return 0;
 }
