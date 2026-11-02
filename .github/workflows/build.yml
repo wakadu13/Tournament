@@ -3,10 +3,16 @@ name: Build
 # Compile le CLIENT pour Linux, macOS (Apple Silicon), Windows et Android,
 # et le SERVEUR DEDIE + le bot pour Linux, macOS et Windows.
 #
-#  - sur une pull request : les executables sont dans l'onglet Actions
-#    (section « Artifacts » du run) ;
-#  - sur un push sur main, ou sur un lancement manuel (« Run workflow ») :
-#    ils sont publies dans la release « latest ».
+#  - sur une pull request : les executables sont seulement deposes dans
+#    l'onglet Actions (section « Artifacts » du run), rien n'est publie ;
+#  - sur un push sur main ou sur une branche de developpement claude/**,
+#    et sur un lancement manuel (« Run workflow ») : ils sont publies dans
+#    la release « latest », qui est remplacee a chaque fois.
+#
+# Note : « Run workflow » n'apparait qu'une fois ce fichier present sur la
+# branche par defaut (regle de GitHub). C'est pourquoi les branches de
+# developpement declenchent aussi la publication : elles permettent
+# d'obtenir les binaires avant la fusion.
 #
 # Les jobs Linux et macOS lancent en plus un TEST DE FUMEE : ils demarrent le
 # serveur, y connectent un bot et verifient dans le journal que la connexion
@@ -14,7 +20,7 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'claude/**']
   pull_request:
   workflow_dispatch:
 
