@@ -1074,6 +1074,8 @@ static bool MobileConnectScreen(char *ip, int cap, const char *name)
     static const char *keys[12] = { "1","2","3","4","5","6","7","8","9",".","0",":" };
     const Color BG = {18, 20, 26, 255};
     char msg[80] = "";
+    bool    held = false;      // un contact est en cours
+    Vector2 held_pos = {0};    // sa derniere position (pixels reels)
 
     for (;;) {
         if (WindowShouldClose()) return false;
@@ -1086,16 +1088,36 @@ static bool MobileConnectScreen(char *ip, int cap, const char *name)
         Rectangle field = { ui_w / 2 - 200, 150, 400, 62 };
         Rectangle erase = { field.x + field.width + 12, field.y, 76, field.height };
 
-        // --- Un appui : on teste les boutons sous le doigt ---
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            Vector2 m = GetMousePosition();
-            m.x /= ui_scale;      // les clics arrivent en pixels réels
+        // --- Un appui = un contact pose PUIS leve sur un bouton ---------
+        // On agit au RELACHEMENT, pas a la pose. IsMouseButtonPressed exige
+        // que la pose et la levee tombent dans deux images differentes, ce
+        // qu'un appui tres bref ne garantit pas ; et sur Android on ne
+        // presume pas de la facon dont raylib emule la souris a partir du
+        // tactile. Ici on lit les DEUX sources : tant qu'un contact existe,
+        // on retient sa position ; quand il disparait, on declenche. C'est
+        // aussi le comportement attendu d'un bouton.
+        int  touches = GetTouchPointCount();
+        bool down = IsMouseButtonDown(MOUSE_BUTTON_LEFT) || touches > 0;
+        if (down) {
+            held = true;
+            held_pos = (touches > 0) ? GetTouchPosition(0) : GetMousePosition();
+        }
+        bool tapped = held && !down;      // le contact vient de se lever
+        if (tapped) {
+            held = false;
+            Vector2 m = held_pos;
+            m.x /= ui_scale;      // les contacts arrivent en pixels réels
             m.y /= ui_scale;
+            // Sur mobile, logcat est le seul temoin : une ligne par appui
+            // (silencieuse sur PC, ou le niveau de log est WARNING).
+            TraceLog(LOG_INFO, "TACTILE: appui relache en (%.0f, %.0f) px -> (%.0f, %.0f) unites",
+                     held_pos.x, held_pos.y, m.x, m.y);
             for (int i = 0; i < 12; i++) {
                 Rectangle r = { gx + (i % 3) * (bw + gap), gy + (i / 3) * (bh + gap), bw, bh };
                 if (!CheckCollisionPointRec(m, r)) continue;
                 size_t len = strlen(ip);
                 if (len + 1 < (size_t)cap) { ip[len] = keys[i][0]; ip[len + 1] = '\0'; }
+                TraceLog(LOG_INFO, "TACTILE: touche '%s' -> adresse \"%s\"", keys[i], ip);
             }
             if (CheckCollisionPointRec(m, erase)) {
                 size_t len = strlen(ip);
