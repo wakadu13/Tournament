@@ -69,9 +69,11 @@
 //----------------------------------------------------------------------------------
 // Le HUD est dessiné en UNITÉS D'INTERFACE : 720 de haut, largeur selon le
 // ratio de l'écran. Sur PC la fenêtre fait exactement SCREEN_W x SCREEN_H et
-// une unité vaut un pixel ; sur un téléphone l'écran est bien plus grand et
-// plus large, et BeginMode2D met tout à l'échelle d'un coup. Sans ça le HUD
-// se tasserait dans un coin de l'écran.
+// une unité vaut un pixel. Sur Android la fenêtre a la taille native de
+// l'écran (InitWindow(0, 0)), bien plus grand et souvent en 20:9 : l'échelle
+// suit la hauteur, la largeur virtuelle suit le ratio, et BeginMode2D met
+// tout à l'échelle d'un coup. Les boutons gardent ainsi la même taille
+// relative d'un téléphone à une tablette, sans bande noire.
 #define UI_H 720                      // hauteur de référence
 static float ui_scale = 1.0f;         // pixels réels par unité d'interface
 static float ui_w = (float)SCREEN_W;  // largeur de l'écran EN UNITÉS
@@ -1181,7 +1183,15 @@ int main(int argc, char **argv)
 #if MOBILE_UI
     // Mobile : la fenêtre d'abord (il faut un écran pour demander l'adresse
     // du serveur), et pas de capture du curseur — on a besoin du doigt.
-    InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament");
+  #if defined(PLATFORM_ANDROID)
+    // 0 x 0 : raylib prend la taille NATIVE de l'écran. Avec 1280 x 720 il
+    // rendrait en 16:9 et agrandirait l'image avec des bandes noires sur les
+    // côtés (vu dans l'émulateur : « Upscaling required »). En natif, c'est
+    // UiUpdate qui adapte le HUD au ratio réel de l'écran.
+    InitWindow(0, 0, "EMA Tournament");
+  #else
+    InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament");   // tactile simulé sur PC
+  #endif
     SetTargetFPS(60);                // 60 Hz : suffisant, et ménage la batterie
     UiUpdate();
     char ip_typed[64] = "";

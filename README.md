@@ -473,9 +473,11 @@ deux points (tout est derrière `MOBILE_UI` dans
   Chaque doigt reçoit un rôle au moment où il se pose et le garde jusqu'à ce
   qu'il soit levé : on peut se déplacer, viser et tirer à trois doigts.
 
-Le HUD est dessiné en **unités d'interface** (720 de haut, largeur selon le
-ratio de l'écran) et mis à l'échelle d'un coup par `BeginMode2D` : il garde
-la même taille relative d'un téléphone à une tablette.
+Le jeu prend **tout l'écran** (`InitWindow(0, 0)` : raylib adopte la taille
+native, sans bande noire). Le HUD est dessiné en **unités d'interface**
+(720 de haut, largeur selon le ratio de l'écran) et mis à l'échelle d'un
+coup par `BeginMode2D` : il garde la même taille relative d'un téléphone à
+une tablette.
 
 Pour régler tout ça **sans téléphone**, compilez avec
 `-DTOUCH_CONTROLS=1` : l'écran d'accueil et les commandes tactiles

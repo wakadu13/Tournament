@@ -33,12 +33,21 @@ adb exec-out screencap -p > "$OUT/android-1-accueil.png"
 PID=$(adb shell pidof $PKG | tr -d '\r')
 adb shell debuggerd -b "$PID" > "$OUT/android-threads.txt" 2>&1 || true
 
-# Taille de l'ecran. "wm size" repond par ex. "Physical size: 1080x2340",
-# en notation portrait : le jeu est en paysage, on echange si besoin.
-SIZE=$(adb shell wm size | tail -1 | sed 's/.*: //' | tr -d '\r')
-W=${SIZE%x*}; H=${SIZE#*x}
-if [ "$W" -lt "$H" ]; then T=$W; W=$H; H=$T; fi
-echo "ecran : ${W}x${H}"
+# Taille de l'ecran telle que LE JEU la voit. On la lit dans le log de
+# raylib (« > Display size: 2204 x 1080 ») et non dans « wm size » : ce
+# dernier compte la barre de navigation Android (2340 de large sur un
+# Pixel 5), que raylib exclut. Les deux reperes partagent leur origine en
+# haut a gauche, donc un pixel de raylib est un pixel d'« input tap ».
+# Secours : wm size, en echangeant largeur et hauteur (notation portrait).
+DISP=$(adb logcat -d -s raylib | grep -o "Display size: *[0-9]* x [0-9]*" | tail -1 | tr -dc '0-9x ')
+if [ -n "$DISP" ]; then
+    W=$(echo "$DISP" | awk '{print $1}'); H=$(echo "$DISP" | awk '{print $3}')
+else
+    SIZE=$(adb shell wm size | tail -1 | sed 's/.*: //' | tr -d '\r')
+    W=${SIZE%x*}; H=${SIZE#*x}
+    if [ "$W" -lt "$H" ]; then T=$W; W=$H; H=$T; fi
+fi
+echo "ecran vu par le jeu : ${W}x${H}"
 
 # --- Unites d'interface -> pixels -------------------------------------
 # Le HUD est dessine sur 720 unites de haut (UI_H dans client/main.c) :
@@ -47,13 +56,20 @@ echo "ecran : ${W}x${H}"
 ux() { echo $(( W/2 + $1 * H / 720 )); }
 uy() { echo $(( $1 * H / 720 )); }
 
+# Un appui qui DURE. « input tap » injecte DOWN puis UP en quelques
+# millisecondes : a 60 images/s, les deux tombent souvent dans la meme
+# image et IsMouseButtonPressed ne voit rien (il lui faut DOWN dans une
+# image et UP dans une autre). Un vrai doigt reste pose 50 a 100 ms ; on
+# imite ca avec un « swipe » sur place de 120 ms.
+press() { adb shell input swipe "$1" "$2" "$1" "$2" 120; }
+
 # Pave numerique de MobileConnectScreen : 3 colonnes de 112 unites
 # espacees de 12, a partir de (centre - 180) ; 4 lignes de 78 espacees de
 # 12, a partir de y = 236. Centre d'une touche (colonne, ligne) :
 #   x = centre - 180 + colonne*124 + 56      y = 236 + ligne*90 + 39
 key() {
-    adb shell input tap "$(ux $(( -180 + $1 * 124 + 56 )))" "$(uy $(( 236 + $2 * 90 + 39 )))"
-    sleep 0.6
+    press "$(ux $(( -180 + $1 * 124 + 56 )))" "$(uy $(( 236 + $2 * 90 + 39 )))"
+    sleep 0.5
 }
 # Disposition :  1 2 3 / 4 5 6 / 7 8 9 / . 0 :
 # "10.0.2.2" = 1(0,0)  0(1,3)  .(0,3)  0(1,3)  .(0,3)  2(1,0)  .(0,3)  2(1,0)
@@ -62,7 +78,7 @@ sleep 1
 adb exec-out screencap -p > "$OUT/android-2-adresse.png"
 
 # CONNECTER : bouton de 280 x 78 centre en x, a y = 236 + 4*90 + 14 + 39 = 649
-adb shell input tap "$(ux 0)" "$(uy 649)"
+press "$(ux 0)" "$(uy 649)"
 sleep 12                         # connexion + premieres images de jeu
 adb exec-out screencap -p > "$OUT/android-3-jeu.png"
 
@@ -83,6 +99,10 @@ cp "$SERVER_LOG" "$OUT/server.log" 2>/dev/null || true
 echo "----- logcat (raylib + systeme) -----"; tail -60 "$OUT/android-logcat.txt"
 echo "----- logcat (plantages) -----";        tail -60 "$OUT/android-crash.txt"
 echo "----- journal du serveur hote -----";   cat "$SERVER_LOG"
+# Les captures doivent DIFFERER : si les quatre sont identiques, aucun
+# appui n'a atteint l'ecran (vu lors de la mise au point). Informatif.
+echo "----- empreintes des captures (identiques = ecran fige) -----"
+md5sum "$OUT"/android-*.png
 
 # --- Verdicts ---------------------------------------------------------
 if ! adb shell pidof $PKG; then echo "ECHEC : le jeu s'est arrete"; exit 1; fi
