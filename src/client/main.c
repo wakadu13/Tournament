@@ -1170,7 +1170,13 @@ int main(int argc, char **argv)
 #endif
     const char *name = (argc > 2) ? argv[2] : "Joueur";
 
-    SetTraceLogLevel(LOG_WARNING);   // raylib moins bavard dans la console
+#if !MOBILE_UI
+    // raylib moins bavard dans la console. PAS sur mobile : logcat y est le
+    // seul canal de diagnostic, et c'est sur ses messages INFO (« Program
+    // shader loaded ») que le test de fumee en CI verifie que l'affichage
+    // s'est initialise.
+    SetTraceLogLevel(LOG_WARNING);
+#endif
 
 #if MOBILE_UI
     // Mobile : la fenêtre d'abord (il faut un écran pour demander l'adresse

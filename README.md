@@ -131,6 +131,14 @@ exécutables des quatre plateformes, compilés par la CI
 | `EMATournament-linux-x64.tar.gz` | `client`, `server`, `bot` |
 | `EMATournament-android.apk` | le jeu au doigt (Android 7.0+, `arm64-v8a` et `x86_64`) |
 
+Avant d'être publié, **l'APK est lancé dans un émulateur Android** par la
+CI (`scripts/android_smoke_test.sh`) : le jeu doit démarrer, initialiser
+l'affichage, puis **se connecter en UDP à un serveur qui tourne sur la
+machine hôte** — l'adresse est tapée sur le pavé numérique de l'écran
+d'accueil, comme le ferait un joueur. Les captures d'écran de chaque étape
+sont dans les artefacts du run (`captures-android`). Un APK qui ne démarre
+pas, ou qui ne joint pas le serveur, bloque la release.
+
 L'APK est signé avec la clé de **debug** du dépôt
 (`android/debug.keystore`) : Android demandera d'autoriser une source
 inconnue à l'installation, et les mises à jour s'installeront par-dessus

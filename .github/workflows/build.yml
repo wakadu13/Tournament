@@ -17,6 +17,11 @@ name: Build
 # Les jobs Linux et macOS lancent en plus un TEST DE FUMEE : ils demarrent le
 # serveur, y connectent un bot et verifient dans le journal que la connexion
 # a bien eu lieu. Un serveur qui ne demarre pas fait echouer la CI.
+#
+# L'APK, lui, est LANCE dans un emulateur Android (job android-test) : le
+# jeu doit demarrer, afficher, et se connecter en UDP a un serveur qui
+# tourne sur la machine hote. La release attend ce verdict : un APK qui ne
+# demarre pas n'est jamais publie.
 
 on:
   push:
@@ -171,12 +176,56 @@ jobs:
           name: EMATournament-android
           path: build-android/EMATournament-android.apk
 
+  android-test:
+    name: Android (test sur emulateur)
+    needs: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: EMATournament-android
+
+      # Le serveur tourne sur la machine hote : l'emulateur le joint par
+      # 10.0.2.2. Pas de raylib a compiler, c'est l'affaire de deux secondes.
+      # nohup + disown : il doit survivre a la fin de cette etape.
+      - name: Demarrer un serveur sur la machine hote
+        run: |
+          make server
+          nohup ./build/server > server.log 2>&1 &
+          disown
+          sleep 1
+          cat server.log
+
+      - name: Activer KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Lancer le jeu dans l'emulateur
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          profile: pixel_5
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: bash scripts/android_smoke_test.sh EMATournament-android.apk captures server.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: captures-android
+          path: captures
+
   release:
     name: Publier la release « latest »
     # Les pull requests ne publient rien : elles deposent seulement leurs
     # artefacts dans l'onglet Actions.
     if: github.event_name != 'pull_request'
-    needs: [linux, macos, windows, android]
+    needs: [linux, macos, windows, android, android-test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
