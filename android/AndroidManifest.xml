@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Application 100 % native (NativeActivity) : le jeu EST la bibliotheque
+     libmain.so, il n'y a aucun code Java (android:hasCode="false"). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.wakadu13.ematournament"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+
+    <!-- Multijoueur : le client parle UDP au serveur. Sans INTERNET, pas de
+         partie du tout — c'est la permission essentielle de ce jeu. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <application
+        android:label="EMA Tournament"
+        android:icon="@drawable/icon"
+        android:hasCode="false"
+        android:extractNativeLibs="true"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+        <!-- Ecrans tres allonges (20:9 et plus) : pas de bandes noires -->
+        <meta-data android:name="android.max_aspect" android:value="3.0" />
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|keyboardHidden|screenSize|smallestScreenSize|screenLayout|keyboard|navigation|density|uiMode"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:maxAspectRatio="3.0">
+            <!-- NativeActivity charge la bibliotheque nommee "main" -->
+            <meta-data android:name="android.app.lib_name" android:value="main" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

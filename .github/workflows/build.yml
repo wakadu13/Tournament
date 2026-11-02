@@ -1,0 +1,214 @@
+name: Build
+
+# Compile le CLIENT pour Linux, macOS (Apple Silicon), Windows et Android,
+# et le SERVEUR DEDIE + le bot pour Linux, macOS et Windows.
+#
+#  - sur une pull request : les executables sont seulement deposes dans
+#    l'onglet Actions (section « Artifacts » du run), rien n'est publie ;
+#  - sur un push sur main ou sur une branche de developpement claude/**,
+#    et sur un lancement manuel (« Run workflow ») : ils sont publies dans
+#    la release « latest », qui est remplacee a chaque fois.
+#
+# Note : « Run workflow » n'apparait qu'une fois ce fichier present sur la
+# branche par defaut (regle de GitHub). C'est pourquoi les branches de
+# developpement declenchent aussi la publication : elles permettent
+# d'obtenir les binaires avant la fusion.
+#
+# Les jobs Linux et macOS lancent en plus un TEST DE FUMEE : ils demarrent le
+# serveur, y connectent un bot et verifient dans le journal que la connexion
+# a bien eu lieu. Un serveur qui ne demarre pas fait echouer la CI.
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Deux pushes rapproches lancent deux runs qui publient tous les deux la
+# release « latest ». Sans garde-fou, le plus ancien peut terminer en
+# DERNIER et ecraser la release avec des binaires perimes. On annule donc
+# le run precedent de la meme branche des qu'un nouveau demarre.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RAYLIB_TAG: "5.5"
+
+jobs:
+  linux:
+    name: Linux (x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependances d'affichage (raylib)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libgl1-mesa-dev
+
+      - name: Compiler raylib ${{ env.RAYLIB_TAG }}
+        run: |
+          git clone --depth 1 --branch "$RAYLIB_TAG" \
+            https://github.com/raysan5/raylib.git raylib-src
+          make -C raylib-src/src PLATFORM=PLATFORM_DESKTOP -j 4
+
+      - name: Compiler le jeu
+        run: make RAYLIB_PATH=raylib-src -j 4
+
+      - name: Test de fumee (serveur + bot)
+        run: |
+          ./build/server > server.log 2>&1 &
+          srv=$!
+          sleep 1
+          ./build/bot 127.0.0.1 CI-Zombie > bot.log 2>&1 &
+          bot=$!
+          sleep 6
+          kill $bot $srv 2>/dev/null || true
+          echo "--- journal du serveur ---"; cat server.log
+          echo "--- journal du bot ---";     cat bot.log
+          grep -q "CI-Zombie rejoint" server.log
+
+      - name: Archive
+        run: |
+          mkdir -p dist
+          tar -czf dist/EMATournament-linux-x64.tar.gz -C build client server bot
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EMATournament-linux-x64
+          path: dist/EMATournament-linux-x64.tar.gz
+
+  macos:
+    name: macOS (Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compiler raylib ${{ env.RAYLIB_TAG }}
+        run: |
+          git clone --depth 1 --branch "$RAYLIB_TAG" \
+            https://github.com/raysan5/raylib.git raylib-src
+          make -C raylib-src/src PLATFORM=PLATFORM_DESKTOP -j 4
+
+      - name: Compiler le jeu
+        run: make RAYLIB_PATH=raylib-src -j 4
+
+      - name: Test de fumee (serveur + bot)
+        run: |
+          ./build/server > server.log 2>&1 &
+          srv=$!
+          sleep 1
+          ./build/bot 127.0.0.1 CI-Zombie > bot.log 2>&1 &
+          bot=$!
+          sleep 6
+          kill $bot $srv 2>/dev/null || true
+          echo "--- journal du serveur ---"; cat server.log
+          grep -q "CI-Zombie rejoint" server.log
+
+      - name: Archive
+        run: |
+          mkdir -p dist
+          tar -czf dist/EMATournament-macos-arm64.tar.gz -C build client server bot
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EMATournament-macos-arm64
+          path: dist/EMATournament-macos-arm64.tar.gz
+
+  windows:
+    name: Windows (x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer MinGW
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 zip
+
+      - name: Compiler raylib ${{ env.RAYLIB_TAG }} pour Windows
+        run: |
+          git clone --depth 1 --branch "$RAYLIB_TAG" \
+            https://github.com/raysan5/raylib.git raylib-win
+          make -C raylib-win/src PLATFORM=PLATFORM_DESKTOP OS=Windows_NT \
+            CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar -j 4
+
+      - name: Compiler le jeu
+        run: make windows RAYLIB_WIN_PATH=raylib-win
+
+      - name: Archive
+        run: |
+          cd dist
+          zip -9 EMATournament-windows-x64.zip *.exe
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EMATournament-windows-x64
+          path: dist/EMATournament-windows-x64.zip
+
+  android:
+    name: Android (APK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sources raylib ${{ env.RAYLIB_TAG }}
+        run: |
+          git clone --depth 1 --branch "$RAYLIB_TAG" \
+            https://github.com/raysan5/raylib.git raylib-src
+
+      - name: Compiler l'APK
+        run: |
+          export ANDROID_NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          RAYLIB_SRC="$PWD/raylib-src" OUT=build-android bash scripts/build_android.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EMATournament-android
+          path: build-android/EMATournament-android.apk
+
+  release:
+    name: Publier la release « latest »
+    # Les pull requests ne publient rien : elles deposent seulement leurs
+    # artefacts dans l'onglet Actions.
+    if: github.event_name != 'pull_request'
+    needs: [linux, macos, windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EMATournament-*
+          path: dist
+          merge-multiple: true
+
+      - name: Remplacer la release « latest »
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -la dist
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest dist/* --target "${{ github.sha }}" \
+            --title "EMA Tournament — derniere version" \
+            --notes "$(cat <<'NOTES'
+          Executables compiles automatiquement depuis la CI.
+
+          | Fichier | Contenu |
+          |---|---|
+          | `EMATournament-windows-x64.zip` | `EMATournament-windows-x64.exe` (le jeu), plus le serveur et le bot en console |
+          | `EMATournament-macos-arm64.tar.gz` | `client`, `server`, `bot` (Apple Silicon) |
+          | `EMATournament-linux-x64.tar.gz` | `client`, `server`, `bot` |
+          | `EMATournament-android.apk` | le jeu au doigt (Android 7.0+, arm64 et x86_64) |
+
+          **Pour jouer** : lancez `server` sur une machine, puis
+          `client <adresse-du-serveur> <pseudo>` sur chaque poste.
+          Sur Android, l'adresse du serveur se tape sur l'ecran d'accueil.
+
+          Le deploiement d'un serveur dedie (Linux, systemd, pare-feu,
+          Cloudflare) est decrit dans le README.
+          NOTES
+          )"
