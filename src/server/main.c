@@ -24,8 +24,17 @@ typedef struct {
     Team               team;
     bool               is_bot;      // relayé aux clients pour le rendu
 
-    V3    pos;
-    float yaw, pitch;
+    PlayerSim sim;          // position, vitesses, au sol : simulé ICI, par les entrées du client
+    float yaw, pitch;       // la vue, relayée telle quelle
+
+    // Suivi des entrées (voir PacketClientInput)
+    uint16_t last_seq;      // dernière entrée traitée
+    bool     has_seq;       // false tant qu'aucune entrée n'est arrivée (après un spawn)
+    // Anti-triche sur le temps : un client ne peut pas simuler plus de temps
+    // qu'il n'en passe réellement. Le budget se remplit au rythme de
+    // l'horloge du serveur et chaque entrée en consomme dt.
+    float  time_budget;
+    double budget_clock;
 
     bool    alive;
     uint8_t spawn_count;    // +1 à chaque respawn (voir protocol.h)
@@ -37,6 +46,16 @@ typedef struct {
 } Player;
 
 static Player   players[MAX_PLAYERS];
+
+// Historique des positions, un cran par tick (~1 s) : pour valider un tir
+// à l'instant que le tireur VOYAIT, pas à l'instant où le paquet arrive.
+typedef struct {
+    uint32_t tick;
+    V3       pos[MAX_PLAYERS];
+    bool     alive[MAX_PLAYERS];
+} HistoryEntry;
+static HistoryEntry history[HISTORY_TICKS];
+static bool PositionAt(int id, float view_time, V3 *out);   // défini plus bas, utilisé par HandleShoot
 static int      team_score[TEAM_COUNT];
 static bool     match_over = false;
 static int      winner = 0;
@@ -72,7 +91,12 @@ static void BroadcastEvent(EventType ev, int a, int b, int value)
 static void SpawnPlayer(Player *p)
 {
     int idx = rand() % SPAWNS_PER_TEAM;
-    p->pos = TEAM_SPAWNS[p->team][idx];
+    memset(&p->sim, 0, sizeof(p->sim));
+    p->sim.pos = TEAM_SPAWNS[p->team][idx];
+    p->sim.on_ground = true;
+    p->has_seq = false;     // les entrées d'avant le spawn sont périmées (spawn_count)
+    p->time_budget = 0.1f;
+    p->budget_clock = Now();
     p->yaw = (p->team == TEAM_RED) ? 0.0f : (float)M_PI; // face au centre
     p->pitch = 0.0f;
     p->health = PLAYER_MAX_HEALTH;
@@ -172,21 +196,36 @@ static void HandleShoot(const PacketShoot *pkt, const struct sockaddr_in *from)
     d.x /= dlen; d.y /= dlen; d.z /= dlen;
 
     // Anti-triche basique : l'origine doit être proche de la tête du joueur
-    V3 eye = {shooter->pos.x, shooter->pos.y + PLAYER_EYE_HEIGHT, shooter->pos.z};
+    // (sa position prédite peut avoir quelques dizaines de ms d'avance sur
+    // la nôtre : 2 m de tolérance)
+    V3 eye = {shooter->sim.pos.x, shooter->sim.pos.y + PLAYER_EYE_HEIGHT, shooter->sim.pos.z};
     float ex = o.x - eye.x, ey = o.y - eye.y, ez = o.z - eye.z;
     if (ex * ex + ey * ey + ez * ez > 4.0f) return;
 
+    // Compensation de lag : le tireur visait ce qu'il VOYAIT, c'est-à-dire
+    // les autres joueurs INTERP_DELAY dans le passé, plus son ping. On
+    // ramène view_time dans l'historique (pas dans le futur, pas plus vieux
+    // que ce qu'on garde) et on teste le tir contre les positions de cet
+    // instant-là.
+    float now_s = (float)tick / SERVER_TICK_HZ;
+    float view_time = pkt->view_time;
+    if (!(view_time <= now_s)) view_time = now_s;                 // futur, ou NaN
+    float oldest = now_s - (float)(HISTORY_TICKS - 2) / SERVER_TICK_HZ;
+    if (view_time < oldest) view_time = oldest;
+
     float wall_t = RaycastMap(o, d);
 
-    // Joueur le plus proche touché avant un mur
+    // Joueur le plus proche touché avant un mur, à sa position d'alors
     int   hit_id = -1;
     float hit_t = wall_t;
     for (int i = 0; i < MAX_PLAYERS; i++) {
         Player *t = &players[i];
         if (!t->active || !t->alive || i == pkt->player_id) continue;
         if (t->team == shooter->team) continue; // pas de friendly fire
+        V3 at;
+        if (!PositionAt(i, view_time, &at)) at = t->sim.pos;   // pas d'historique : position actuelle
         float ht;
-        if (RayVsBox(o, d, PlayerBox(t->pos), &ht) && ht > 0.0f && ht < hit_t) {
+        if (RayVsBox(o, d, PlayerBox(at), &ht) && ht > 0.0f && ht < hit_t) {
             hit_t = ht;
             hit_id = i;
         }
@@ -218,6 +257,67 @@ static void HandleShoot(const PacketShoot *pkt, const struct sockaddr_in *from)
     }
 }
 
+// Rejoue les entrées d'un client que le serveur n'a pas encore vues, dans
+// l'ordre, avec le MÊME code de simulation que lui (PlayerStep). C'est ici
+// que le serveur fait autorité sur le mouvement : un client modifié peut
+// envoyer n'importe quelles entrées, il ne peut pas envoyer de position.
+static void ApplyInputs(Player *p, const PacketClientInput *pkt)
+{
+    int count = pkt->count;
+    if (count < 1 || count > INPUT_BATCH) return;
+
+    // Le budget de temps se remplit au rythme de l'horloge du serveur
+    // (plafonné : une rafale après un à-coup réseau reste acceptée)
+    double now = Now();
+    p->time_budget += (float)(now - p->budget_clock);
+    p->budget_clock = now;
+    if (p->time_budget > 0.25f) p->time_budget = 0.25f;
+
+    for (int i = 0; i < count; i++) {
+        const InputEntry *e = &pkt->entries[i];
+        // Déjà traitée ? (différence signée sur 16 bits : gère le bouclage)
+        if (p->has_seq && (int16_t)(e->seq - p->last_seq) <= 0) continue;
+
+        float dt = e->dt;
+        if (!(dt > 0.0f)) continue;                 // 0, négatif ou NaN
+        if (dt > INPUT_MAX_DT) dt = INPUT_MAX_DT;   // une image ne dure pas plus
+        if (p->time_budget < dt) break;             // plus de temps à simuler : triche ou gel, on attend
+        p->time_budget -= dt;
+
+        PlayerCmd c = CmdFromEntry(e);
+        // Le déplacement ne peut pas dépasser 1 (le client normalise ; un
+        // client modifié n'irait pas plus vite pour autant)
+        float m2 = c.move_x * c.move_x + c.move_y * c.move_y;
+        if (m2 > 1.0f) { float inv = 1.0f / sqrtf(m2); c.move_x *= inv; c.move_y *= inv; }
+
+        PlayerStep(&p->sim, &c, dt);
+        p->yaw = e->yaw;
+        p->pitch = e->pitch;
+        p->last_seq = e->seq;
+        p->has_seq = true;
+    }
+}
+
+// Position d'un joueur à un instant passé (secondes serveur), interpolée
+// entre les deux ticks de l'historique qui l'encadrent. Renvoie false si
+// le joueur n'était pas vivant à cet instant ou si l'instant est inconnu.
+static bool PositionAt(int id, float view_time, V3 *out)
+{
+    float ft = view_time * SERVER_TICK_HZ;
+    uint32_t t0 = (uint32_t)ft;
+    float a = ft - (float)t0;
+    const HistoryEntry *h0 = &history[t0 % HISTORY_TICKS];
+    const HistoryEntry *h1 = &history[(t0 + 1) % HISTORY_TICKS];
+    if (h0->tick != t0) return false;               // trop vieux : déjà écrasé
+    if (!h0->alive[id]) return false;
+    if (h1->tick != t0 + 1) { *out = h0->pos[id]; return true; }   // tick suivant pas encore écrit
+    if (!h1->alive[id]) { *out = h0->pos[id]; return true; }
+    out->x = h0->pos[id].x + (h1->pos[id].x - h0->pos[id].x) * a;
+    out->y = h0->pos[id].y + (h1->pos[id].y - h0->pos[id].y) * a;
+    out->z = h0->pos[id].z + (h1->pos[id].z - h0->pos[id].z) * a;
+    return true;
+}
+
 static void HandlePacket(const uint8_t *buf, sock_ssize_t len, const struct sockaddr_in *from)
 {
     if (len < (sock_ssize_t)sizeof(PacketHeader)) return;
@@ -228,19 +328,14 @@ static void HandlePacket(const uint8_t *buf, sock_ssize_t len, const struct sock
             HandleConnect((const PacketConnect *)buf, from);
         break;
 
-    case PKT_CL_STATE:
-        if (len >= (sock_ssize_t)sizeof(PacketClientState)) {
-            const PacketClientState *pkt = (const PacketClientState *)buf;
+    case PKT_CL_INPUT:
+        if (len >= (sock_ssize_t)sizeof(PacketClientInput)) {
+            const PacketClientInput *pkt = (const PacketClientInput *)buf;
             Player *p = ValidSender(pkt->player_id, from);
-            // spawn_count : on rejette les positions datant d'avant le
-            // dernier respawn (sinon elles ramèneraient le joueur à
-            // l'endroit de sa mort)
-            if (p && p->alive && pkt->spawn_count == p->spawn_count) {
-                // TODO anti-triche : valider la vitesse de déplacement
-                p->pos = (V3){pkt->x, pkt->y, pkt->z};
-                p->yaw = pkt->yaw;
-                p->pitch = pkt->pitch;
-            }
+            // spawn_count : on rejette les entrées datant d'avant le dernier
+            // respawn (elles feraient bouger le joueur depuis sa mort)
+            if (p && p->alive && pkt->spawn_count == p->spawn_count)
+                ApplyInputs(p, pkt);
         }
         break;
 
@@ -283,8 +378,11 @@ static void SendSnapshot(void)
         s->health = (int16_t)p->health;
         s->kills = (uint16_t)p->kills;
         s->deaths = (uint16_t)p->deaths;
-        s->x = p->pos.x; s->y = p->pos.y; s->z = p->pos.z;
+        s->x = p->sim.pos.x; s->y = p->sim.pos.y; s->z = p->sim.pos.z;
         s->yaw = p->yaw; s->pitch = p->pitch;
+        s->vx = p->sim.vel.x; s->vz = p->sim.vel.z; s->vy = p->sim.vel_y;
+        s->on_ground = p->sim.on_ground ? 1 : 0;
+        s->last_seq = p->last_seq;
         memcpy(s->name, p->name, NAME_MAX);
     }
     Broadcast(&snap, sizeof(snap));
@@ -334,6 +432,14 @@ int main(int argc, char **argv)
             float dt = (float)(now - last_tick);
             last_tick = now;
             tick++;
+
+            // Historique de ce tick (compensation de lag)
+            HistoryEntry *h = &history[tick % HISTORY_TICKS];
+            h->tick = tick;
+            for (int i = 0; i < MAX_PLAYERS; i++) {
+                h->pos[i] = players[i].sim.pos;
+                h->alive[i] = players[i].active && players[i].alive;
+            }
 
             for (int i = 0; i < MAX_PLAYERS; i++) {
                 Player *p = &players[i];

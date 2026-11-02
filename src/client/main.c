@@ -105,11 +105,6 @@ static Camera2D UiCamera(void)
 #define FOV_ADS    50.0f           // en visant : effet de zoom
 #define FOV_SPRINT 84.0f           // en sprint : impression de vitesse
 
-#define SPRINT_SPEED      10.5f    // m/s en sprint (PLAYER_SPEED sinon)
-#define ACCEL_GROUND      12.0f    // accélération au sol (réactif)
-#define ACCEL_AIR         2.5f     // en l'air : faible contrôle aérien
-
-#define INTERP_SPEED      15.0f    // vitesse de lissage des autres joueurs
 
 #define KILLFEED_MAX   5
 #define KILLFEED_TTL   5.0f        // durée d'affichage d'une ligne (s)
@@ -140,17 +135,68 @@ static CharAnim anim[MAX_PLAYERS];
 //----------------------------------------------------------------------------------
 // État local du joueur (prédiction)
 //----------------------------------------------------------------------------------
-static V3    my_pos;               // position des PIEDS (comme sur le serveur)
-static V3    my_vel = {0};         // vitesse horizontale actuelle (m/s)
-static float my_vel_y = 0.0f;      // vitesse verticale (saut / gravité)
+// Notre simulation (position des pieds, vitesses, au sol) : le MÊME code
+// que le serveur (PlayerStep, game.c). On la fait tourner en avance sur lui
+// (prédiction) et on se recale sur ses snapshots (réconciliation).
+static PlayerSim my_sim;
 static float my_yaw = 0.0f;        // regard gauche/droite (radians)
 static float my_pitch = 0.0f;      // regard haut/bas (radians)
 static bool  my_alive = true;      // décidé par le serveur
 static uint8_t my_spawn_count = 0; // compteur de respawn (voir protocol.h)
-static bool  on_ground = true;
 static bool  sprinting = false;
 static float dead_t = 0.0f;        // temps écoulé depuis notre mort (anim caméra)
 static int   last_health = PLAYER_MAX_HEALTH;
+
+static void SnapPush(const PacketSnapshot *sp);
+static void Reconcile(const SnapshotPlayer *me);
+
+//----------------------------------------------------------------------------------
+// Prédiction et réconciliation
+//----------------------------------------------------------------------------------
+// Chaque image produit UNE entrée (déplacement, vue, saut...), simulée
+// tout de suite et gardée ici jusqu'à ce que le serveur l'acquitte
+// (champ last_seq du snapshot). À chaque snapshot on repart de l'état que
+// le serveur nous donne et on rejoue les entrées qu'il n'a pas encore vues.
+#define PENDING_MAX 256                    // ~1,8 s à 144 images/s : largement plus qu'un ping
+static InputEntry pending[PENDING_MAX];    // anneau : head = plus ancienne
+static int        pending_head = 0, pending_count = 0;
+static uint16_t   my_seq = 0;              // numéro de la dernière entrée produite
+
+static InputEntry PendingAt(int i) { return pending[(pending_head + i) % PENDING_MAX]; }
+static void PendingPush(const InputEntry *e)
+{
+    if (pending_count == PENDING_MAX) {    // plein : on oublie la plus ancienne
+        pending_head = (pending_head + 1) % PENDING_MAX;
+        pending_count--;
+    }
+    pending[(pending_head + pending_count) % PENDING_MAX] = *e;
+    pending_count++;
+}
+// Retire toutes les entrées jusqu'à seq compris (différence signée sur
+// 16 bits : gère le bouclage du compteur)
+static void PendingAck(uint16_t seq)
+{
+    while (pending_count > 0 && (int16_t)(PendingAt(0).seq - seq) <= 0) {
+        pending_head = (pending_head + 1) % PENDING_MAX;
+        pending_count--;
+    }
+}
+
+//----------------------------------------------------------------------------------
+// Interpolation des autres joueurs
+//----------------------------------------------------------------------------------
+// Les snapshots n'arrivent que 20 fois/s : on affiche les autres joueurs
+// INTERP_DELAY dans le passé, entre les deux snapshots qui encadrent cet
+// instant. Le mouvement est fluide et, surtout, ce qu'on voit correspond à
+// un instant serveur PRÉCIS : c'est lui qu'on envoie avec nos tirs, et le
+// serveur rembobine les cibles à cet instant (compensation de lag).
+#define SNAP_BUF 32
+typedef struct { PacketSnapshot snap; bool valid; } SnapEntry;
+static SnapEntry snapbuf[SNAP_BUF];        // anneau indexé par le tick
+static double server_offset = 0.0;         // temps serveur ~= GetTime() + server_offset
+static bool   have_offset = false;
+static float  view_time = 0.0f;            // instant serveur affiché cette image
+static float  display_yaw[MAX_PLAYERS];    // orientation interpolée
 
 //----------------------------------------------------------------------------------
 // État de l'arme et des animations de la vue
@@ -274,13 +320,20 @@ static bool NetConnect(const char *ip, const char *name)
 }
 
 // Envoie notre position/orientation (appelé CLIENT_SEND_HZ fois par seconde)
-static void NetSendState(void)
+// Envoie les INPUT_BATCH dernières entrées (ou moins). Les mêmes repartent
+// dans plusieurs paquets de suite : si l'un se perd, le suivant les porte.
+// Sans entrée en attente (mort, fin de match), le paquet part vide : il
+// sert alors de battement de cœur contre le timeout du serveur.
+static void NetSendInputs(void)
 {
-    PacketClientState pkt = {
-        PKT_CL_STATE, (uint8_t)my_id, my_spawn_count,
-        my_pos.x, my_pos.y, my_pos.z,
-        my_yaw, my_pitch,
-    };
+    PacketClientInput pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = PKT_CL_INPUT;
+    pkt.player_id = (uint8_t)my_id;
+    pkt.spawn_count = my_spawn_count;
+    int n = (pending_count < INPUT_BATCH) ? pending_count : INPUT_BATCH;
+    for (int i = 0; i < n; i++) pkt.entries[i] = PendingAt(pending_count - n + i);
+    pkt.count = (uint8_t)n;
     sendto(sock_fd, &pkt, sizeof(pkt), 0,
            (struct sockaddr *)&server_addr, sizeof(server_addr));
 }
@@ -293,6 +346,7 @@ static void NetSendShoot(V3 origin, V3 dir)
         PKT_CL_SHOOT, (uint8_t)my_id,
         origin.x, origin.y, origin.z,
         dir.x, dir.y, dir.z,
+        view_time,                 // l'instant qu'on voyait : le serveur y rembobine les cibles
     };
     sendto(sock_fd, &pkt, sizeof(pkt), 0,
            (struct sockaddr *)&server_addr, sizeof(server_addr));
@@ -362,22 +416,34 @@ static void NetReceive(void)
         last_server_msg = GetTime();
 
         if (buf[0] == PKT_SV_SNAPSHOT && n >= (sock_ssize_t)sizeof(PacketSnapshot)) {
+            const PacketSnapshot *in = (const PacketSnapshot *)buf;
+            // Un snapshot plus vieux que le dernier reçu (UDP réordonné) va
+            // dans le tampon d'interpolation mais ne devient pas « le dernier »
+            if (have_offset && (int32_t)(in->tick - snap.tick) <= 0) {
+                SnapPush(in);
+                continue;
+            }
             memcpy(&snap, buf, sizeof(snap));
+            SnapPush(&snap);
 
             // Le serveur fait autorité sur notre vie. Quand son compteur
             // de respawn change (y compris au tout premier spawn), on
             // reprend la position qu'IL a choisie, et on écho le nouveau
-            // compteur dans nos paquets d'état.
+            // compteur dans nos paquets d'entrées.
             SnapshotPlayer *me = &snap.players[my_id];
             if (me->active) {
                 if (me->spawn_count != my_spawn_count) {   // (re)spawn
                     my_spawn_count = me->spawn_count;
-                    my_pos = (V3){me->x, me->y, me->z};
+                    memset(&my_sim, 0, sizeof(my_sim));
+                    my_sim.pos = (V3){me->x, me->y, me->z};
+                    my_sim.on_ground = me->on_ground != 0;
                     my_yaw = me->yaw;
                     my_pitch = me->pitch;
-                    my_vel = (V3){0};
-                    my_vel_y = 0.0f;
+                    pending_head = 0;        // tout ce qui précède est périmé
+                    pending_count = 0;
                     dead_t = 0.0f;
+                } else if (me->alive) {
+                    Reconcile(me);
                 }
                 my_alive = me->alive != 0;
                 // La vie a baissé depuis le dernier snapshot : voile rouge
@@ -410,7 +476,7 @@ static V3 LookDir(void)
 // Position des yeux (la caméra), au-dessus des pieds
 static V3 EyePos(void)
 {
-    return (V3){my_pos.x, my_pos.y + PLAYER_EYE_HEIGHT, my_pos.z};
+    return (V3){my_sim.pos.x, my_sim.pos.y + PLAYER_EYE_HEIGHT, my_sim.pos.z};
 }
 
 // Dispersion des balles : rayon du cône de tir (~radians). Dépend de :
@@ -421,10 +487,10 @@ static V3 EyePos(void)
 // Le réticule du HUD s'écarte avec cette même valeur.
 static float WeaponSpread(void)
 {
-    float hspeed = sqrtf(my_vel.x * my_vel.x + my_vel.z * my_vel.z);
+    float hspeed = sqrtf(my_sim.vel.x * my_sim.vel.x + my_sim.vel.z * my_sim.vel.z);
     return Lerp(0.022f, 0.002f, ads)
          + hspeed * 0.003f
-         + (on_ground ? 0.0f : 0.04f)
+         + (my_sim.on_ground ? 0.0f : 0.04f)
          + bloom;
 }
 
@@ -586,33 +652,28 @@ static void UpdateLocalPlayer(float dt)
     // Sprint : en avançant, incompatible avec viser/tirer
     sprinting = in.sprint && move.y > 0.3f && !aiming && !firing;
 
-    // --- Déplacement : vitesse voulue puis accélération progressive.
-    // "devant" et "droite" sont calculés à plat (sans le pitch) : on se
-    // déplace au sol même en regardant en l'air. ---
-    V3 fwd = {sinf(my_yaw), 0, cosf(my_yaw)};
-    V3 right = {fwd.z, 0, -fwd.x};
-    float speed = (sprinting ? SPRINT_SPEED : PLAYER_SPEED)
-                * (1.0f - ads * 0.4f);   // -40 % en visant
-    V3 wish = {
-        (fwd.x * move.y + right.x * move.x) * speed, 0,
-        (fwd.z * move.y + right.z * move.x) * speed,
-    };
-    // La vitesse actuelle se rapproche de la vitesse voulue d'une fraction
-    // (dt * accel) par frame : démarrage et freinage en douceur, et faible
-    // contrôle en l'air (on garde son élan pendant un saut).
-    float accel = on_ground ? ACCEL_GROUND : ACCEL_AIR;
-    my_vel.x += (wish.x - my_vel.x) * fminf(1.0f, dt * accel);
-    my_vel.z += (wish.z - my_vel.z) * fminf(1.0f, dt * accel);
-
-    // Saut : seulement au sol
-    if (in.jump && on_ground) my_vel_y = PLAYER_JUMP_SPEED;
-
-    // Collisions et gravité (code partagé avec le serveur/bot)
-    MovePlayer(&my_pos, my_vel, &my_vel_y, dt, &on_ground);
+    // --- Déplacement : UNE entrée pour cette image, simulée tout de suite
+    // (prédiction) et gardée jusqu'à l'acquittement du serveur. Le
+    // déplacement est quantifié sur un octet AVANT de simuler : le serveur
+    // rejouera exactement la même valeur. ---
+    InputEntry e;
+    memset(&e, 0, sizeof(e));
+    e.seq = ++my_seq;
+    e.dt = (dt > INPUT_MAX_DT) ? INPUT_MAX_DT : dt;
+    e.move_x = (int8_t)lroundf(move.x * 127.0f);
+    e.move_y = (int8_t)lroundf(move.y * 127.0f);
+    e.flags = (uint8_t)((in.jump ? INPUT_JUMP : 0)
+                      | (sprinting ? INPUT_SPRINT : 0)
+                      | ((aiming && !sprinting) ? INPUT_ADS : 0));
+    e.yaw = my_yaw;
+    e.pitch = my_pitch;
+    PlayerCmd cmd = CmdFromEntry(&e);
+    PlayerStep(&my_sim, &cmd, e.dt);      // collisions et gravité : code partagé
+    PendingPush(&e);
 
     // Phase du balancement de marche : avance avec la vitesse au sol
-    float hspeed = sqrtf(my_vel.x * my_vel.x + my_vel.z * my_vel.z);
-    if (on_ground) bob += dt * hspeed * 1.6f;
+    float hspeed = sqrtf(my_sim.vel.x * my_sim.vel.x + my_sim.vel.z * my_sim.vel.z);
+    if (my_sim.on_ground) bob += dt * hspeed * 1.6f;
 
     // --- Tir : automatique tant que le bouton est maintenu, à la cadence
     // WEAPON_COOLDOWN, et jamais pendant un sprint ---
@@ -663,7 +724,7 @@ static void UpdateLookTargets(void)
 
         Vector3 self = display_pos[i];
         if (!sp->alive) {   // mort : plus de regard
-            CharAnimLookAt(&anim[i], self, sp->yaw, self, false);
+            CharAnimLookAt(&anim[i], self, display_yaw[i], self, false);
             continue;
         }
 
@@ -673,11 +734,11 @@ static void UpdateLookTargets(void)
 
         // Nous d'abord : notre position n'est pas dans display_pos
         if (my_alive && my_id >= 0 && snap.players[my_id].team != sp->team) {
-            float dx = my_pos.x - self.x, dz = my_pos.z - self.z;
+            float dx = my_sim.pos.x - self.x, dz = my_sim.pos.z - self.z;
             float d2 = dx * dx + dz * dz;
             if (d2 < best_d2) {
                 best_d2 = d2;
-                best = (Vector3){my_pos.x, my_pos.y, my_pos.z};
+                best = (Vector3){my_sim.pos.x, my_sim.pos.y, my_sim.pos.z};
                 found = true;
             }
         }
@@ -689,19 +750,95 @@ static void UpdateLookTargets(void)
             float d2 = dx * dx + dz * dz;
             if (d2 < best_d2) { best_d2 = d2; best = display_pos[j]; found = true; }
         }
-        CharAnimLookAt(&anim[i], self, sp->yaw, best, found);
+        CharAnimLookAt(&anim[i], self, display_yaw[i], best, found);
     }
 }
 
-// Les autres joueurs glissent vers leur dernière position reçue : les
-// snapshots n'arrivent que 20 fois/s, sans lissage ils "téléporteraient".
+// Range un snapshot dans l'anneau et affine l'horloge serveur estimée.
+static void SnapPush(const PacketSnapshot *sp)
+{
+    SnapEntry *e = &snapbuf[sp->tick % SNAP_BUF];
+    e->snap = *sp;
+    e->valid = true;
+    // temps serveur du snapshot - instant de réception : l'écart entre nos
+    // deux horloges, lissé (il contient la gigue), repris d'un coup s'il
+    // décroche (pause, reconnexion)
+    double off = (double)sp->tick / SERVER_TICK_HZ - GetTime();
+    if (!have_offset || fabs(off - server_offset) > 0.5) { server_offset = off; have_offset = true; }
+    else server_offset += (off - server_offset) * 0.05;
+}
+
+// Réconciliation : le serveur nous dit où il nous a mis après notre entrée
+// last_seq. On repart de là et on rejoue nos entrées plus récentes. Si nos
+// prédictions étaient justes (presque toujours), on retombe au même
+// endroit ; sinon la correction du serveur s'applique, et il a raison.
+static void Reconcile(const SnapshotPlayer *me)
+{
+    PendingAck(me->last_seq);
+    PlayerSim s;
+    memset(&s, 0, sizeof(s));
+    s.pos = (V3){me->x, me->y, me->z};
+    s.vel = (V3){me->vx, 0, me->vz};
+    s.vel_y = me->vy;
+    s.on_ground = me->on_ground != 0;
+    for (int i = 0; i < pending_count; i++) {
+        InputEntry e = PendingAt(i);
+        PlayerCmd c = CmdFromEntry(&e);
+        PlayerStep(&s, &c, e.dt);
+    }
+    my_sim = s;
+}
+
+// Interpolation d'un angle par le chemin le plus court
+static float LerpAngle(float a, float b, float t)
+{
+    float d = b - a;
+    while (d >  PI) d -= 2.0f * PI;
+    while (d < -PI) d += 2.0f * PI;
+    return a + d * t;
+}
+
+// Les autres joueurs sont affichés INTERP_DELAY dans le passé, entre les
+// deux snapshots qui encadrent cet instant (voir SnapEntry). S'il manque
+// le snapshot suivant (à-coup réseau), on reste sur le dernier connu : on
+// n'extrapole jamais.
 static void InterpolateOthers(float dt)
 {
-    float k = 1.0f - expf(-INTERP_SPEED * dt);  // fraction du chemin restant
+    if (!have_offset) return;
+    double render = GetTime() + server_offset - INTERP_DELAY;
+    view_time = (float)render;
+
+    const SnapEntry *a = NULL, *b = NULL;    // a : le plus récent <= render ; b : le plus ancien > render
+    double ta = 0, tb = 0;
+    for (int i = 0; i < SNAP_BUF; i++) {
+        if (!snapbuf[i].valid) continue;
+        double t = (double)snapbuf[i].snap.tick / SERVER_TICK_HZ;
+        if (t <= render && (!a || t > ta)) { a = &snapbuf[i]; ta = t; }
+        if (t >  render && (!b || t < tb)) { b = &snapbuf[i]; tb = t; }
+    }
+    if (!a && !b) return;
+    if (!a) { a = b; ta = tb; }
+    if (!b) { b = a; tb = ta; }
+    float alpha = (tb > ta) ? (float)((render - ta) / (tb - ta)) : 0.0f;
+
     for (int i = 0; i < MAX_PLAYERS; i++) {
-        SnapshotPlayer *sp = &snap.players[i];
+        SnapshotPlayer *sp = &snap.players[i];          // drapeaux : le dernier snapshot
         if (!sp->active || i == my_id) { has_display[i] = false; continue; }
-        Vector3 target = {sp->x, sp->y, sp->z};
+        const SnapshotPlayer *pa = &a->snap.players[i], *pb = &b->snap.players[i];
+        if (!pa->active) pa = pb;
+        if (!pb->active) pb = pa;
+
+        Vector3 target;
+        float yaw;
+        if (!pa->active) { target = (Vector3){sp->x, sp->y, sp->z}; yaw = sp->yaw; }
+        else if (pa->spawn_count != pb->spawn_count) {
+            // Respawn entre les deux : pas d'interpolation à travers l'arène
+            target = (Vector3){pb->x, pb->y, pb->z}; yaw = pb->yaw;
+        } else {
+            target = Vector3Lerp((Vector3){pa->x, pa->y, pa->z}, (Vector3){pb->x, pb->y, pb->z}, alpha);
+            yaw = LerpAngle(pa->yaw, pb->yaw, alpha);
+        }
+
         Vector3 before = display_pos[i];
         if (!has_display[i]) {
             display_pos[i] = target;   // première apparition : direct
@@ -712,8 +849,9 @@ static void InterpolateOthers(float dt)
             before = target;
             CharAnimTeleport(&anim[i]);   // et son cadavre ne se relève pas
         } else {
-            display_pos[i] = Vector3Lerp(display_pos[i], target, k);
+            display_pos[i] = target;
         }
+        display_yaw[i] = yaw;
 
         // Toute l'animation se déduit du déplacement affiché cette image
         // (allure, foulée, saut, atterrissage) et de l'état vivant/mort :
@@ -735,7 +873,7 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
         // la tête penchée sur le côté.
         dead_t += dt;
         float k = fminf(dead_t * 2.0f, 1.0f);
-        cam->position = (Vector3){eye.x, Lerp(eye.y, my_pos.y + 0.35f, k), eye.z};
+        cam->position = (Vector3){eye.x, Lerp(eye.y, my_sim.pos.y + 0.35f, k), eye.z};
         cam->target = (Vector3){eye.x + sinf(my_yaw), cam->position.y - 0.3f,
                                 eye.z + cosf(my_yaw)};
         cam->up = Vector3Normalize((Vector3){cosf(my_yaw) * 0.6f, 1.0f, 0});
@@ -747,8 +885,8 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
     // Head bob : rebond vertical proportionnel à la vitesse, presque
     // supprimé en visée pour garder la mire stable
     float eye_y = eye.y;
-    if (on_ground) {
-        float hspeed = sqrtf(my_vel.x * my_vel.x + my_vel.z * my_vel.z);
+    if (my_sim.on_ground) {
+        float hspeed = sqrtf(my_sim.vel.x * my_sim.vel.x + my_sim.vel.z * my_sim.vel.z);
         eye_y += sinf(bob * 2.0f) * 0.03f
                * fminf(hspeed / PLAYER_SPEED, 1.4f) * (1.0f - ads * 0.8f);
     }
@@ -827,8 +965,8 @@ static void DrawPlayers(void)
         Vector3 p = display_pos[i];
         Color col = TeamColor(sp->team);
 
-        if (sp->is_bot) DrawZombieChick(p, sp->yaw, &anim[i], col);
-        else            DrawSoldier(p, sp->yaw, &anim[i], col);
+        if (sp->is_bot) DrawZombieChick(p, display_yaw[i], &anim[i], col);
+        else            DrawSoldier(p, display_yaw[i], &anim[i], col);
 
         // Ombre "pastille" du premier jeu : elle se resserre quand il saute
         // et s'étale quand il est couché.
@@ -1242,7 +1380,8 @@ int main(int argc, char **argv)
 
     // Position de départ : premier spawn de notre équipe. Le premier
     // snapshot du serveur corrigera si besoin.
-    my_pos = TEAM_SPAWNS[my_team][0];
+    my_sim.pos = TEAM_SPAWNS[my_team][0];
+    my_sim.on_ground = true;
     my_yaw = (my_team == TEAM_RED) ? 0.0f : (float)M_PI;   // face au centre
     memset(&snap, 0, sizeof(snap));
 
@@ -1268,7 +1407,7 @@ int main(int argc, char **argv)
         // Envoi périodique de notre position au serveur
         if (GetTime() - last_state_send > 1.0 / CLIENT_SEND_HZ) {
             last_state_send = GetTime();
-            NetSendState();
+            NetSendInputs();
         }
 
         BeginDrawing();

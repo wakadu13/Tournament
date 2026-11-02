@@ -4,11 +4,26 @@
 
 #include <stdint.h>
 
-#define PROTO_VERSION   1
+// v2 : le client envoie ses ENTREES (deplacement, vue, saut...), plus ses
+// positions. Le serveur simule lui-meme : un client modifie ne peut plus se
+// teleporter. Les tirs portent l'instant que le tireur VOYAIT, et le serveur
+// rembobine les cibles a cet instant (compensation de lag).
+#define PROTO_VERSION   2
 #define DEFAULT_PORT    7777
 
 #define MAX_PLAYERS     16
 #define NAME_MAX        16
+
+// Entrees du joueur
+#define INPUT_BATCH     8       // entrees par paquet : les dernieres, repetees d'un paquet a l'autre (pertes)
+#define INPUT_MAX_DT    0.05f   // duree maximale simulee par une entree (s) : au-dela, triche ou gel
+#define INPUT_JUMP      0x01
+#define INPUT_SPRINT    0x02
+#define INPUT_ADS       0x04
+
+// Compensation de lag
+#define HISTORY_TICKS   64      // positions gardees par le serveur (~1 s a 60 Hz)
+#define INTERP_DELAY    0.10f   // le client affiche les autres 100 ms dans le passe (2 snapshots)
 
 // Fréquences
 #define SERVER_TICK_HZ  60      // simulation serveur
@@ -22,8 +37,8 @@
 typedef enum {
     // Client -> Serveur
     PKT_CL_CONNECT = 1,     // demande de connexion (nom)
-    PKT_CL_STATE,           // position/orientation du joueur
-    PKT_CL_SHOOT,           // tir (origine + direction)
+    PKT_CL_INPUT,           // entrees du joueur (deplacement, vue, saut...)
+    PKT_CL_SHOOT,           // tir (origine + direction + instant vu)
     PKT_CL_DISCONNECT,      // départ propre
 
     // Serveur -> Client
@@ -72,25 +87,42 @@ typedef struct {
     char    reason[32];
 } PacketReject;
 
-// État envoyé par le client (mouvement prédit côté client,
-// le serveur reste autoritaire sur la vie/les scores).
-// spawn_count : écho du compteur de respawn reçu dans les snapshots.
-// Le serveur ignore les positions dont le compteur ne correspond pas :
-// sans cela, un paquet de position parti juste AVANT que le client
-// apprenne son respawn le ramènerait à l'endroit de sa mort.
+// Une entrée du joueur : ce qu'il a fait pendant UNE image. Le client en
+// produit une par image et les simule aussitôt (prédiction) ; le serveur
+// les rejoue dans l'ordre avec le MÊME code (PlayerStep, game.c) et fait
+// autorité. Le déplacement est quantifié sur un octet : les deux côtés
+// simulent la valeur déquantifiée, pour que la prédiction soit exacte.
 typedef struct {
-    uint8_t  type;          // PKT_CL_STATE
-    uint8_t  player_id;
-    uint8_t  spawn_count;
-    float    x, y, z;
-    float    yaw, pitch;    // en radians
-} PacketClientState;
+    uint16_t seq;           // numéro d'entrée, +1 par image (boucle à 65536)
+    float    dt;            // durée simulée par cette entrée (s), <= INPUT_MAX_DT
+    int8_t   move_x;        // -127..127 : vers la droite
+    int8_t   move_y;        // -127..127 : vers l'avant
+    uint8_t  flags;         // INPUT_JUMP | INPUT_SPRINT | INPUT_ADS
+    uint8_t  pad;
+    float    yaw, pitch;    // la vue, en radians (le serveur la relaie telle quelle)
+} InputEntry;
+
+// Paquet d'entrées : les INPUT_BATCH dernières, de la plus ancienne à la
+// plus récente. Le serveur ignore celles qu'il a déjà vues (seq <= dernier
+// traité) : la redondance protège des pertes UDP sans rien dupliquer.
+// spawn_count : écho du compteur de respawn reçu dans les snapshots. Le
+// serveur ignore les entrées d'un compteur périmé : sans cela, une entrée
+// partie juste AVANT que le client apprenne son respawn ferait bouger le
+// joueur depuis l'endroit de sa mort.
+typedef struct {
+    uint8_t    type;        // PKT_CL_INPUT
+    uint8_t    player_id;
+    uint8_t    spawn_count;
+    uint8_t    count;       // entrées valides dans entries[] (1..INPUT_BATCH)
+    InputEntry entries[INPUT_BATCH];
+} PacketClientInput;
 
 typedef struct {
     uint8_t  type;          // PKT_CL_SHOOT
     uint8_t  player_id;
     float    ox, oy, oz;    // origine du rayon (caméra)
     float    dx, dy, dz;    // direction normalisée
+    float    view_time;     // instant serveur (s) que le tireur VOYAIT (voir INTERP_DELAY)
 } PacketShoot;
 
 typedef struct {
@@ -111,6 +143,13 @@ typedef struct {
     uint16_t deaths;
     float    x, y, z;
     float    yaw, pitch;
+    // Pour la réconciliation du joueur LOCAL : l'état complet de sa
+    // simulation après la dernière entrée traitée (last_seq). Il repart de
+    // là et rejoue ses entrées plus récentes.
+    float    vx, vz;        // vitesse horizontale (accélération progressive)
+    float    vy;            // vitesse verticale
+    uint8_t  on_ground;
+    uint16_t last_seq;      // dernière entrée traitée par le serveur
     char     name[NAME_MAX];
 } SnapshotPlayer;
 

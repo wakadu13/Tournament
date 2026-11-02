@@ -30,13 +30,29 @@ scripts/              build_android.sh (APK sans Gradle)
 ```
 
 - **Transport** : UDP, paquets binaires packés (`#pragma pack`).
-- **Serveur autoritaire** sur les tirs (raycast serveur), la vie, les
-  kills, les scores et les respawns. Il valide l'expéditeur de chaque
-  paquet (id + adresse), l'origine des tirs, et rejette les positions
-  datant d'avant un respawn (compteur `spawn_count`).
-- **Client prédictif** : le déplacement est simulé localement (fluide
-  quel que soit le ping) et envoyé 30×/s ; les autres joueurs sont
-  interpolés entre les snapshots (20 Hz).
+- **Serveur autoritaire sur tout** : le déplacement, les tirs, la vie,
+  les kills, les scores et les respawns. Le client n'envoie jamais de
+  position, seulement ses **entrées** (déplacement, vue, saut, sprint,
+  visée), que le serveur rejoue avec le même code de simulation que lui
+  (`PlayerStep`, `game.c`). Un client modifié peut envoyer n'importe
+  quelles entrées ; il ne peut ni se téléporter ni accélérer (budget de
+  temps simulé borné par l'horloge du serveur). Il valide aussi
+  l'expéditeur de chaque paquet (id + adresse), l'origine des tirs, et
+  rejette les entrées datant d'avant un respawn (compteur `spawn_count`).
+- **Client prédictif et réconcilié** : chaque image, le client simule son
+  entrée tout de suite (fluide quel que soit le ping) et la garde jusqu'à
+  ce que le serveur l'acquitte (`last_seq` du snapshot). À chaque
+  snapshot il repart de l'état que le serveur lui donne et rejoue ses
+  entrées plus récentes : si ses prédictions étaient justes, il retombe
+  au même endroit ; sinon la correction s'applique. Les 8 dernières
+  entrées partent dans chaque paquet (30×/s) : une perte UDP ne coûte
+  rien.
+- **Compensation de lag** : les autres joueurs sont affichés 100 ms dans
+  le passé, interpolés entre les deux snapshots (20 Hz) qui encadrent cet
+  instant, et le client joint à chaque tir **l'instant qu'il voyait**. Le
+  serveur garde une seconde d'historique des positions et **rembobine les
+  cibles à cet instant** avant de lancer le rayon : on touche ce qu'on
+  visait, pas là où la cible est arrivée pendant le trajet du paquet.
 
 ## Vue FPS
 
@@ -259,9 +275,10 @@ Ou plus simplement : prendre `server` dans
 ```
 
 Le serveur affiche les connexions, les éliminations et le score sur sa
-sortie standard. Il est **autoritaire** : il valide l'expéditeur de chaque
-paquet (identifiant + adresse), l'origine des tirs, et rejette les
-positions datant d'avant un respawn.
+sortie standard. Il est **autoritaire** : c'est lui qui déplace les
+joueurs à partir de leurs entrées, lui qui valide les tirs (en rembobinant
+les cibles à l'instant que le tireur voyait), et il vérifie l'expéditeur
+de chaque paquet (identifiant + adresse) et l'origine des tirs.
 
 ### 2. L'installer en service (systemd)
 
@@ -340,13 +357,14 @@ Mesuré sur le protocole réel (`src/common/protocol.h`) :
 
 | | Valeur |
 |---|---|
-| Taille d'un snapshot | **779 octets** (16 emplacements de 48 octets + en-tête) |
+| Taille d'un snapshot | **1 019 octets** (16 emplacements de 63 octets + en-tête) |
 | Fréquence d'envoi | 20 Hz (`SNAPSHOT_HZ`) |
-| Montant serveur, 16 joueurs | 779 × 20 × 16 ≈ **250 ko/s, soit 2 Mbit/s** |
-| Montant par client | 23 octets × 30 Hz ≈ **690 octets/s** |
-| Tick de simulation | 60 Hz, un seul fil d'exécution |
+| Montant serveur, 16 joueurs | 1 019 × 20 × 16 ≈ **326 ko/s, soit 2,6 Mbit/s** |
+| Montant par client | 148 octets (8 entrées) × 30 Hz ≈ **4,4 ko/s** |
+| Tick de simulation | 60 Hz, un seul fil d'exécution ; les entrées sont rejouées à leur arrivée |
+| Historique pour les tirs | 64 ticks ≈ 1 s de positions, pour tous les joueurs |
 
-Autrement dit : un VPS à 1 vCPU / 512 Mo et 2 Mbit/s d'upload suffit pour
+Autrement dit : un VPS à 1 vCPU / 512 Mo et 3 Mbit/s d'upload suffit pour
 une partie pleine. Le serveur envoie l'état **complet** du monde à chaque
 snapshot (pas de delta), donc la bande passante monte au **carré** du
 nombre de joueurs — c'est ce qui fixe `MAX_PLAYERS` à 16.
@@ -493,8 +511,6 @@ de [src/client/main.c](src/client/main.c).
 
 ## Pistes pour la suite
 
-- Lag compensation (rembobiner les positions pour valider les tirs)
-- Anti-triche sur le déplacement (valider la vitesse côté serveur)
 - Plusieurs armes, munitions, rechargement
 - Sons (tirs, hits, cris de poussin)
 - Chat texte, et menu de connexion in-game sur PC (il existe déjà sur Android)

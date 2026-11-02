@@ -14,6 +14,9 @@
 #define SCORE_LIMIT         30      // kills pour gagner le match
 
 #define PLAYER_SPEED        7.0f    // m/s
+#define SPRINT_SPEED        10.5f   // m/s en sprint
+#define ACCEL_GROUND        12.0f   // accélération au sol (réactif)
+#define ACCEL_AIR           2.5f    // en l'air : faible contrôle aérien
 #define PLAYER_JUMP_SPEED   6.0f
 #define GRAVITY             18.0f
 #define PLAYER_RADIUS       0.4f    // demi-largeur du joueur (AABB)
@@ -44,6 +47,32 @@ extern const V3 TEAM_SPAWNS[TEAM_COUNT][SPAWNS_PER_TEAM];
 // vel_h = vitesse horizontale en m/s (l'appelant gère l'accélération),
 // vel_y est mis à jour (gravité/atterrissage), *on_ground indique le sol.
 void MovePlayer(V3 *pos, V3 vel_h, float *vel_y, float dt, bool *on_ground);
+
+// --- Simulation d'un joueur, partagée client / serveur / bot ---------------
+// Le client la fait tourner en avance (prédiction), le serveur fait
+// autorité, et le client se recale sur lui : les deux DOIVENT produire le
+// même résultat pour la même entrée. Tout le mouvement passe donc par ici.
+typedef struct {
+    V3    pos;        // pieds
+    V3    vel;        // vitesse horizontale actuelle (x, z ; y inutilisé)
+    float vel_y;      // vitesse verticale (saut / gravité)
+    bool  on_ground;
+} PlayerSim;
+
+// Ce que le joueur demande pendant un pas
+typedef struct {
+    float move_x, move_y;   // -1..1, longueur <= 1 (droite, avant)
+    float yaw;              // orientation de la vue (le déplacement est à plat)
+    bool  jump, sprint, ads;
+} PlayerCmd;
+
+// Une entrée réseau -> commande, en déquantifiant le déplacement EXACTEMENT
+// comme le client l'a fait avant de simuler (sinon la prédiction diverge).
+PlayerCmd CmdFromEntry(const InputEntry *e);
+
+// Un pas de simulation : vitesse voulue, accélération progressive, saut,
+// puis collisions et gravité (MovePlayer).
+void PlayerStep(PlayerSim *s, const PlayerCmd *c, float dt);
 
 // Raycast contre une boîte. Retourne true et la distance si touchée.
 bool RayVsBox(V3 origin, V3 dir, Box box, float *t_out);

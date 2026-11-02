@@ -48,9 +48,17 @@ static Team               my_team = TEAM_RED;
 static PacketSnapshot snap;        // dernier état du monde reçu du serveur
 static bool           has_snap = false;
 
-static V3    pos;                  // position des pieds (simulée localement)
-static float vel_y = 0.0f;         // vitesse verticale (gravité / sauts)
+static V3    pos;                  // position des pieds, LUE dans les snapshots (le serveur simule)
 static float yaw = 0.0f;           // orientation (pour que les clients le voient tourné)
+static uint32_t pos_tick = 0;      // tick du snapshot d'où vient pos
+
+// Entrées : le bot n'envoie plus de position mais ce qu'il VEUT faire, et
+// le serveur le déplace avec le même code que pour un joueur. Une entrée
+// par tick, les INPUT_BATCH dernières dans chaque paquet (redondance).
+static InputEntry pending[INPUT_BATCH];
+static int        pending_n = 0;   // entrées dans pending[], la plus récente en dernier
+static uint16_t   my_seq = 0;
+static float      jump_hold = 0.0f;   // secondes pendant lesquelles on demande à sauter
 static bool  alive = true;
 static uint8_t spawn_count = 0;    // compteur de respawn (voir protocol.h)
 static float attack_cd = 0.0f;     // temps avant la prochaine griffe
@@ -58,6 +66,7 @@ static float attack_cd = 0.0f;     // temps avant la prochaine griffe
 // Détection de blocage : si on veut avancer mais qu'on ne bouge presque
 // pas, on est coincé contre un obstacle -> saut + pas de côté
 static V3    last_pos;
+static uint32_t last_pos_tick = 0; // tick de last_pos : on mesure entre deux snapshots
 static float stuck_time = 0.0f;    // depuis combien de temps on est coincé
 static float dodge_time = 0.0f;    // temps restant de pas de côté
 static int   dodge_side = 1;       // -1 = gauche, +1 = droite
@@ -117,13 +126,35 @@ static bool NetConnect(const char *ip, const char *name)
     return false;
 }
 
-static void NetSendState(void)
+// Ajoute l'entrée de ce tick (déplacement relatif à yaw : avant = vers la
+// proie), en ne gardant que les INPUT_BATCH dernières
+static void PushInput(float dt, float mx, float my, bool jump)
 {
-    PacketClientState pkt = {
-        PKT_CL_STATE, (uint8_t)my_id, spawn_count,
-        pos.x, pos.y, pos.z,
-        yaw, 0.0f,                 // un zombie regarde droit devant
-    };
+    if (pending_n == INPUT_BATCH) {
+        memmove(&pending[0], &pending[1], sizeof(InputEntry) * (INPUT_BATCH - 1));
+        pending_n--;
+    }
+    InputEntry *e = &pending[pending_n++];
+    memset(e, 0, sizeof(*e));
+    e->seq = ++my_seq;
+    e->dt = (dt > INPUT_MAX_DT) ? INPUT_MAX_DT : dt;
+    e->move_x = (int8_t)lroundf(mx * 127.0f);
+    e->move_y = (int8_t)lroundf(my * 127.0f);
+    e->flags = jump ? INPUT_JUMP : 0;
+    e->yaw = yaw;
+    e->pitch = 0.0f;               // un zombie regarde droit devant
+}
+
+// Envoie les dernières entrées (vide = simple battement de cœur)
+static void NetSendInputs(void)
+{
+    PacketClientInput pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = PKT_CL_INPUT;
+    pkt.player_id = (uint8_t)my_id;
+    pkt.spawn_count = spawn_count;
+    pkt.count = (uint8_t)pending_n;
+    memcpy(pkt.entries, pending, sizeof(InputEntry) * (size_t)pending_n);
     sendto(sock_fd, &pkt, sizeof(pkt), 0,
            (struct sockaddr *)&server_addr, sizeof(server_addr));
 }
@@ -134,6 +165,7 @@ static void NetSendAttack(V3 origin, V3 dir)
         PKT_CL_SHOOT, (uint8_t)my_id,
         origin.x, origin.y, origin.z,
         dir.x, dir.y, dir.z,
+        (float)pos_tick / SERVER_TICK_HZ,   // on vise ce que montrait le dernier snapshot
     };
     sendto(sock_fd, &pkt, sizeof(pkt), 0,
            (struct sockaddr *)&server_addr, sizeof(server_addr));
@@ -152,15 +184,20 @@ static void NetReceive(void)
             memcpy(&snap, buf, sizeof(snap));
             has_snap = true;
 
-            // Le serveur décide de notre vie et de nos respawns : quand
-            // son compteur de respawn change, on adopte la position qu'il
-            // a choisie et on écho le compteur dans nos paquets d'état.
+            // Le serveur simule notre déplacement : notre position est
+            // TOUJOURS celle qu'il nous donne (50 ms de retard, sans
+            // importance pour un zombie). Au respawn on écho son compteur
+            // dans nos paquets d'entrées et on oublie les entrées d'avant.
             SnapshotPlayer *me = &snap.players[my_id];
             if (me->active) {
+                pos = (V3){me->x, me->y, me->z};
+                pos_tick = snap.tick;
                 if (me->spawn_count != spawn_count) {
                     spawn_count = me->spawn_count;
-                    pos = (V3){me->x, me->y, me->z};
-                    vel_y = 0.0f;
+                    pending_n = 0;
+                    last_pos = pos;
+                    last_pos_tick = pos_tick;
+                    stuck_time = 0.0f;
                     printf("[zombie] respawn en (%.0f, %.0f)\n", pos.x, pos.z);
                 }
                 alive = me->alive != 0;
@@ -194,61 +231,59 @@ static SnapshotPlayer *NearestEnemy(float *dist_out)
 static void ZombieThink(float dt)
 {
     if (attack_cd > 0.0f) attack_cd -= dt;
-    if (!alive || !has_snap || snap.match_over) return;
+    if (jump_hold > 0.0f) jump_hold -= dt;
+
+    // Mort, pas encore de snapshot, ou match fini : une entrée vide quand
+    // même (elle fait tourner la gravité et sert de battement de cœur)
+    if (!alive || !has_snap || snap.match_over) { PushInput(dt, 0, 0, false); return; }
 
     float dist;
     SnapshotPlayer *target = NearestEnemy(&dist);
+    if (!target) { PushInput(dt, 0, 0, false); return; }   // personne à chasser : planté là
 
-    // Personne à chasser : le zombie reste planté là (la gravité
-    // continue de s'appliquer, au cas où il serait en l'air)
-    if (!target) {
-        bool grounded;
-        MovePlayer(&pos, (V3){0}, &vel_y, dt, &grounded);
-        return;
-    }
-
-    // Direction vers la cible, à plat, normalisée
+    // Il regarde sa proie : le déplacement est relatif à yaw, donc
+    // « en avant » = vers elle
     V3 to_target = {target->x - pos.x, 0, target->z - pos.z};
     float len = sqrtf(to_target.x * to_target.x + to_target.z * to_target.z);
     if (len > 0.001f) { to_target.x /= len; to_target.z /= len; }
-    yaw = atan2f(to_target.x, to_target.z);   // il regarde sa proie
+    yaw = atan2f(to_target.x, to_target.z);
 
     // --- Déplacement : droit sur la cible, sauf pendant un pas de côté
-    // (anti-blocage). On s'arrête un peu avant le contact pour ne pas
-    // pousser la cible. ---
-    V3 vel = {0};
+    // (anti-blocage). Le serveur applique PLAYER_SPEED x longueur du
+    // déplacement : on envoie ZOMBIE_SPEED / PLAYER_SPEED pour rester lent.
+    // On s'arrête un peu avant le contact pour ne pas pousser la cible. ---
+    float mx = 0.0f, my = 0.0f;
     if (dist > ZOMBIE_ATTACK_RANGE * 0.7f) {
-        vel.x = to_target.x * ZOMBIE_SPEED;
-        vel.z = to_target.z * ZOMBIE_SPEED;
-        if (dodge_time > 0.0f) {
-            // Pas de côté : on remplace le mouvement par un déplacement
-            // perpendiculaire (vecteur "droite" = (z, -x) du vecteur avant)
-            dodge_time -= dt;
-            vel.x = to_target.z * ZOMBIE_SPEED * (float)dodge_side;
-            vel.z = -to_target.x * ZOMBIE_SPEED * (float)dodge_side;
-        }
+        float k = ZOMBIE_SPEED / PLAYER_SPEED;
+        if (dodge_time > 0.0f) { dodge_time -= dt; mx = k * (float)dodge_side; }   // pas de côté
+        else my = k;
     }
 
-    bool grounded;
-    MovePlayer(&pos, vel, &vel_y, dt, &grounded);
-
-    // --- Anti-blocage : on voulait avancer mais on n'a presque pas bougé
-    // pendant 0,4 s -> on saute (obstacle bas) et on fait un pas de côté
-    // d'une demi-seconde dans un sens aléatoire (contournement grossier) ---
-    bool wants_to_move = (vel.x != 0.0f || vel.z != 0.0f);
-    float moved = fabsf(pos.x - last_pos.x) + fabsf(pos.z - last_pos.z);
-    if (wants_to_move && moved < ZOMBIE_SPEED * dt * 0.3f) {
-        stuck_time += dt;
-        if (stuck_time > 0.4f) {
+    // --- Anti-blocage : la position ne change qu'à l'arrivée d'un snapshot,
+    // on mesure donc entre deux snapshots. Si on voulait avancer mais qu'on
+    // n'a presque pas bougé pendant 0,4 s : saut (obstacle bas) et pas de
+    // côté d'une demi-seconde dans un sens aléatoire. ---
+    if (last_pos_tick == 0) { last_pos = pos; last_pos_tick = pos_tick; }
+    if (pos_tick != last_pos_tick) {
+        float span = (float)(pos_tick - last_pos_tick) / SERVER_TICK_HZ;
+        float moved = fabsf(pos.x - last_pos.x) + fabsf(pos.z - last_pos.z);
+        bool wants_to_move = (mx != 0.0f || my != 0.0f);
+        if (wants_to_move && moved < ZOMBIE_SPEED * span * 0.3f) {
+            stuck_time += span;
+            if (stuck_time > 0.4f) {
+                stuck_time = 0.0f;
+                jump_hold = 0.15f;          // le serveur ne saute que s'il est au sol
+                dodge_time = 0.5f;
+                dodge_side = (rand() % 2) ? 1 : -1;
+            }
+        } else {
             stuck_time = 0.0f;
-            if (grounded) vel_y = PLAYER_JUMP_SPEED;   // tente de sauter par-dessus
-            dodge_time = 0.5f;
-            dodge_side = (rand() % 2) ? 1 : -1;
         }
-    } else {
-        stuck_time = 0.0f;
+        last_pos = pos;
+        last_pos_tick = pos_tick;
     }
-    last_pos = pos;
+
+    PushInput(dt, mx, my, jump_hold > 0.0f);
 
     // --- Griffe : à portée et cooldown écoulé. L'attaque part de nos
     // yeux vers la poitrine de la cible (comme un tir à bout portant,
@@ -301,11 +336,11 @@ int main(int argc, char **argv)
             ZombieThink(dt);
         }
 
-        // L'envoi d'état sert aussi de battement de cœur : sans lui le
+        // L'envoi des entrées sert aussi de battement de cœur : sans lui le
         // serveur nous déconnecterait au timeout de 5 s
         if (now - last_send >= send_dt) {
             last_send = now;
-            NetSendState();
+            NetSendInputs();
         }
 
         PlatformSleepMs(2);   // ~2 ms : ne sature pas un cœur de CPU

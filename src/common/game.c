@@ -100,6 +100,45 @@ void MovePlayer(V3 *pos, V3 vel_h, float *vel_y, float dt, bool *on_ground)
     if (pos->z >  lim) pos->z =  lim;
 }
 
+// --- Simulation d'un joueur (partagée) ---------------------------------------
+PlayerCmd CmdFromEntry(const InputEntry *e)
+{
+    PlayerCmd c;
+    c.move_x = (float)e->move_x / 127.0f;
+    c.move_y = (float)e->move_y / 127.0f;
+    c.yaw    = e->yaw;
+    c.jump   = (e->flags & INPUT_JUMP) != 0;
+    c.sprint = (e->flags & INPUT_SPRINT) != 0;
+    c.ads    = (e->flags & INPUT_ADS) != 0;
+    return c;
+}
+
+void PlayerStep(PlayerSim *s, const PlayerCmd *c, float dt)
+{
+    // "devant" et "droite" sont calculés à plat (sans le pitch) : on se
+    // déplace au sol même en regardant en l'air.
+    V3 fwd = {sinf(c->yaw), 0, cosf(c->yaw)};
+    V3 right = {fwd.z, 0, -fwd.x};
+    float speed = (c->sprint ? SPRINT_SPEED : PLAYER_SPEED)
+                * (1.0f - (c->ads ? 0.4f : 0.0f));   // -40 % en visant
+    V3 wish = {
+        (fwd.x * c->move_y + right.x * c->move_x) * speed, 0,
+        (fwd.z * c->move_y + right.z * c->move_x) * speed,
+    };
+    // La vitesse actuelle se rapproche de la vitesse voulue d'une fraction
+    // (dt * accel) par pas : démarrage et freinage en douceur, et faible
+    // contrôle en l'air (on garde son élan pendant un saut).
+    float accel = s->on_ground ? ACCEL_GROUND : ACCEL_AIR;
+    float k = dt * accel;
+    if (k > 1.0f) k = 1.0f;
+    s->vel.x += (wish.x - s->vel.x) * k;
+    s->vel.z += (wish.z - s->vel.z) * k;
+
+    if (c->jump && s->on_ground) s->vel_y = PLAYER_JUMP_SPEED;
+
+    MovePlayer(&s->pos, s->vel, &s->vel_y, dt, &s->on_ground);
+}
+
 // Méthode des "slabs" : intersection rayon/AABB
 bool RayVsBox(V3 o, V3 d, Box box, float *t_out)
 {
