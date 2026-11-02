@@ -1,0 +1,3 @@
+-std=c11
+-Isrc
+-I/opt/homebrew/opt/raylib/include
