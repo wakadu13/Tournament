@@ -1382,7 +1382,7 @@ static void DrawHUD(void)
     // --- Éliminé : on attend la fin de la manche (pas de respawn) ---
     if (me && me->active && !me->alive && !snap.match_over && snap.round_phase != ROUND_END) {
         DrawRectangle(0, 0, UIW, UIH, Fade(BLACK, 0.5f));
-        const char *msg = "Éliminé — en attente de la prochaine manche";
+        const char *msg = "Éliminé : en attente de la prochaine manche";
         DrawText(msg, UIW / 2 - MeasureText(msg, 30) / 2, UIH / 2 - 15, 30, RED);
     }
 

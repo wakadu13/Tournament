@@ -49,7 +49,7 @@ static MenuAction MainScreen(MenuScreen *screen, const char *status)
 {
     float cx = vw / 2;
     UiTextCentered("EMA TOURNAMENT", cx, 24, 44, RAYWHITE);
-    UiTextCentered("Manches à élimination sur une carte façon Dust — 9 armes", cx, 74, 18, GRAY);
+    UiTextCentered("Manches à élimination sur une carte façon Dust, 9 armes", cx, 74, 18, GRAY);
 
     // Serveur et pseudo. Un contact sur un champ lui donne les frappes.
     Rectangle fs = { cx - 300, 124, 400, 50 };
@@ -183,7 +183,7 @@ static MenuAction WeaponsScreen(MenuScreen *screen, bool in_game, const char *st
     float fw = panel.x + panel.width - 24 - x2;
     DrawText(ws->name, (int)x2, 70, 30, RAYWHITE);
     char line[96];
-    snprintf(line, sizeof(line), "%s — tir %s", ws->kind, ModeName(ws->mode));
+    snprintf(line, sizeof(line), "%s, tir %s", ws->kind, ModeName(ws->mode));
     DrawText(line, (int)x2, 104, 16, LIGHTGRAY);
     float by = 134;
     UiBar((Rectangle){ x2, by, fw, 18 }, "Dégâts", (float)(ws->damage * ws->pellets), 100.0f, (Color){220, 90, 70, 255});
