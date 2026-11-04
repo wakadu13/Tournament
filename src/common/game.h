@@ -28,20 +28,47 @@
 #define PLAYER_RADIUS       0.4f    // demi-largeur du joueur (AABB)
 #define PLAYER_HEIGHT       1.8f
 #define PLAYER_EYE_HEIGHT   1.6f    // hauteur des yeux depuis les pieds
+#define STEP_HEIGHT         0.55f   // marche franchie sans sauter (escaliers, trottoirs)
 
 // --- Vecteur minimal (le serveur ne dépend pas de raylib) ------------------
 typedef struct { float x, y, z; } V3;
 
 // --- Map : une arène faite de boîtes alignées sur les axes (AABB) ----------
+// Le genre (kind) ne sert qu'au rendu : couleur, et forme dessinée (un
+// tonneau ou une colonne est dessiné en cylindre, un sac de sable en
+// ellipsoïde) ; les collisions et les tirs voient toujours la boîte.
+typedef enum {
+    K_WALL = 0,     // mur, bloc : pisé sable
+    K_CRATE,        // caisse de bois
+    K_BARREL,       // tonneau (cylindre)
+    K_SANDBAG,      // sacs de sable (ellipsoïde)
+    K_ROOF,         // toit, dalle
+    K_STEP,         // marche, plateau
+    K_WOOD,         // bois sombre : portes, poutres, linteaux
+    K_STONE,        // pierre grise : colonnes, arches
+    K_METAL,        // métal : grilles, poteaux
+    K_AWNING,       // toile d'auvent
+    K_CLOTH,        // tapis, bâche
+    K_COUNT
+} BoxKind;
+
 typedef struct {
     V3 min;
     V3 max;
+    int kind;       // BoxKind
 } Box;
 
 #define ARENA_HALF 60.0f    // l'arène fait 120x120 m, comme une carte de Counter-Strike
 
-extern const Box MAP_BOXES[];
-extern const int MAP_BOX_COUNT;
+// La carte est CONSTRUITE au démarrage (MapInit) par des fonctions qui
+// posent murs, portes, fenêtres, escaliers, caisses... : plus lisible et
+// plus sûr qu'une liste de coordonnées. À appeler avant tout le reste.
+#define MAP_MAX_BOXES 1024
+extern Box MAP_BOXES[MAP_MAX_BOXES];   // ce qui bloque (joueurs et balles)
+extern int MAP_BOX_COUNT;
+extern Box MAP_DECOR[MAP_MAX_BOXES];   // ce qui se voit seulement (client)
+extern int MAP_DECOR_COUNT;
+void MapInit(void);
 
 #define SPAWNS_PER_TEAM 5
 extern const V3 TEAM_SPAWNS[TEAM_COUNT][SPAWNS_PER_TEAM];

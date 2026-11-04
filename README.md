@@ -27,29 +27,43 @@ le chrono au centre, et un point par survivant sous chaque score.
 ## La carte
 
 Inspirée de Dust 2, à l'échelle d'une vraie carte de Counter-Strike :
-**120 × 120 m**, faite de boîtes alignées sur les axes (`MAP_BOXES` dans
-[src/common/game.c](src/common/game.c)). Les T (bleus) partent au sud, les
+**120 × 120 m**. Elle est **construite au démarrage** (`MapInit` dans
+[src/common/game.c](src/common/game.c)) par des fonctions qui posent des
+murs percés de **portes** et de **fenêtres**, des **escaliers**, des
+caisses, des tonneaux, des sacs de sable, des colonnes et des arcades :
+environ 170 volumes qui bloquent joueurs et balles, et 200 éléments de
+décor (battants de portes, encadrements, auvents, tapis, poutres,
+créneaux) que seul le client dessine. Les T (bleus) partent au sud, les
 CT (rouges) au nord, et trois voies relient les deux camps vers les deux
 **sites** (A au nord-est, B au nord-ouest) :
 
 | Voie | Description |
 |---|---|
-| **Mid** | couloir central de 20 m de large, coupé par les « doubles portes » (deux piliers, passage de 6 m) ; au sud, l'enseigne au poussin et la caisse « xbox » servent de couverture ; au nord, il débouche sur le spawn CT |
-| **Long A** | à l'est, un couloir de 12 m de large et 58 m de long, fermé au sud par les « long doors » (passage de 4 m), qui débouche au nord sur le **site A** |
-| **Catwalk** | du haut de mid vers le site A, un couloir de 6 m |
-| **Tunnels** | à l'ouest, les tunnels **hauts** longent l'enceinte sous un toit (il laisse passer un joueur mais bloque les tirs en cloche) jusqu'au **site B** ; les tunnels **bas** les relient à mid à travers le bloc ouest, sous un toit eux aussi |
-| **Connecteur** | du haut de mid vers le site B, un couloir de 6 m |
-| **B doors** | du spawn CT au site B, une porte de 4 m |
+| **Mid** | couloir central de 20 m, coupé par les « doubles portes » (un mur percé d'un passage de 5 m, battants ouverts) ; l'enseigne au poussin, la caisse « xbox » et deux murets servent de couverture ; au nord, top mid et ses sacs de sable débouchent sur le spawn CT, abrité par une **arcade** à colonnes |
+| **Catwalk** | une **passerelle à 2,40 m** : on monte un escalier depuis top mid, on longe le bloc nord jusqu'au site A, que l'on domine d'un garde-corps avant de redescendre par un second escalier |
+| **Long A** | à l'est, un couloir de 12 m de large et 58 m de long, fermé au sud par les **long doors** (un passage couvert avec une porte à chaque bout), avec un muret, des sacs de sable et le « coin de long » et ses tonneaux ; il débouche sous une arche sur le **site A** |
+| **Tunnels** | à l'ouest, les tunnels **hauts** longent l'enceinte sous un toit porté par des colonnes (il laisse passer un joueur mais bloque les tirs en cloche) jusqu'au **site B** ; les tunnels **bas** les relient à mid à travers le bloc ouest, sous leurs poutres |
+| **Connecteur** | du haut de mid vers le site B, un couloir de 6 m ; il dessert la **salle de la fenêtre**, une pièce qui domine mid par une fenêtre : on tire à travers, on ne passe pas |
+| **B doors** | du spawn CT au site B, une porte de 4 m avec son linteau |
 
-Les sites ont un **plateau** à 1,60 m (deux marches de 0,80 m : un saut monte
-à 1 m) et des caisses ; les spawns et les couloirs ont des couvertures
-basses. Toutes les voies font au moins 4 m de large.
+Les sites ont un **plateau** à 1,60 m qui se monte par ses **escaliers**
+(ou d'un saut, 1 m), des caisses empilées, des tonneaux et des sacs de
+sable ; le site B a un **réduit** (une petite pièce contre l'enceinte,
+porte à l'est), le spawn T une **maison** (porte à l'ouest, fenêtre au
+nord) et son arcade. Toutes les voies font au moins 4 m de large.
 
-Les bots suivent des **points de passage** (`NAV_NODES`, 25 nœuds reliés
-quand on peut marcher droit de l'un à l'autre) : un zombie qui ne voit pas
-sa proie cherche le chemin le plus court sur ce graphe et le suit, puis
-fonce dès qu'il l'aperçoit. Un harnais vérifie que les spawns sont
-dégagés, que chaque lien est praticable et que le graphe est connexe.
+Les **marches** de 0,55 m au plus se franchissent en marchant
+(`STEP_HEIGHT`, dans la physique partagée : le client prédit exactement ce
+que le serveur calcule) ; une caisse d'un mètre se saute.
+
+Les bots suivent des **points de passage** (`NAV_NODES`, 26 nœuds reliés
+quand on arrive de l'un à l'autre en marchant droit, escaliers compris) :
+un zombie qui ne voit pas sa proie cherche le chemin le plus court sur ce
+graphe et le suit, puis fonce dès qu'il l'aperçoit. Un harnais fait
+**marcher un joueur simulé** sur chaque lien et vérifie que les spawns
+sont dégagés, que le graphe est connexe, que les escaliers se montent,
+que les portes se passent et que les fenêtres arrêtent les joueurs mais
+pas les balles.
 
 Les joueurs humains incarnent des **soldats-mercenaires** (treillis olive,
 visage peint en vert, yeux injectés de sang, démarche bras tendus) ; les
@@ -106,7 +120,7 @@ Les bots (poussins zombies) n'ont que leurs **griffes** : 25 dégâts à
 src/
 ├── common/           Code partagé par les trois programmes
 │   ├── protocol.h    Protocole réseau UDP (paquets, constantes)
-│   └── game.h/.c     Règles, armes, map (AABB), points de passage, collisions, raycasts
+│   └── game.h/.c     Règles, armes, construction de la map (AABB), points de passage, collisions
 │   └── platform.h    Sockets, horloge et sleep : Windows / Linux / macOS / Android
 ├── server/main.c     Serveur dédié headless (autoritaire)
 ├── client/main.c     Client raylib (vue FPS, prédiction, HUD, boucle des menus)
@@ -646,9 +660,10 @@ s'activent sur PC, la souris jouant le rôle du doigt.
 
 Tout est dans [src/common/game.h](src/common/game.h) : vitesse, gravité,
 durée d'une manche, manches gagnantes, temps d'achat, multiplicateur des
-tirs à la tête... La map (liste de boîtes `MAP_BOXES`), les points de
-passage des bots (`NAV_NODES`) et la table des armes (`WEAPONS` : dégâts,
-cadence, portée, chargeur, dispersion, recul) sont dans
+tirs à la tête, hauteur de marche... La map (`MapInit` : murs, portes,
+fenêtres, escaliers, caisses...), les points de passage des bots
+(`NAV_NODES`) et la table des armes (`WEAPONS` : dégâts, cadence, portée,
+chargeur, dispersion, recul) sont dans
 [src/common/game.c](src/common/game.c).
 Les réglages de la vue FPS (FOV, sensibilité, accélérations) sont en tête
 de [src/client/main.c](src/client/main.c).

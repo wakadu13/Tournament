@@ -633,6 +633,7 @@ int main(int argc, char **argv)
 {
     int port = (argc > 1) ? atoi(argv[1]) : DEFAULT_PORT;
     srand((unsigned)time(NULL));
+    MapInit();
     setvbuf(stdout, NULL, _IOLBF, 0); // logs visibles même redirigés
 
     if (!PlatformNetInit()) { printf("pile reseau indisponible\n"); return 1; }

@@ -395,6 +395,7 @@ int main(int argc, char **argv)
     const char *name = (argc > 2) ? argv[2] : "Zombie";
     srand((unsigned)(time(NULL) ^ getpid()));
     setvbuf(stdout, NULL, _IOLBF, 0);   // logs visibles même redirigés
+    MapInit();
 
     if (!NetConnect(ip, name)) return 1;
 

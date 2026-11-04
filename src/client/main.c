@@ -1071,6 +1071,78 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
 //----------------------------------------------------------------------------------
 // Rendu : map, joueurs, arme, HUD
 //----------------------------------------------------------------------------------
+// Une boîte de la map, selon son genre (voir BoxKind dans game.h)
+static void DrawMapBox(const Box *b)
+{
+    static const Color KIND_COLORS[K_COUNT] = {
+        [K_WALL]    = {212, 190, 142, 255},   // pisé sable
+        [K_CRATE]   = {156, 118,  72, 255},   // bois clair
+        [K_BARREL]  = { 86,  96,  78, 255},   // tôle vert-de-gris
+        [K_SANDBAG] = {150, 140, 100, 255},   // toile kaki
+        [K_ROOF]    = {150, 140, 125, 255},   // dalle
+        [K_STEP]    = {196, 172, 128, 255},   // pierre claire
+        [K_WOOD]    = { 96,  62,  34, 255},   // bois sombre
+        [K_STONE]   = {160, 152, 138, 255},   // pierre grise
+        [K_METAL]   = { 80,  82,  88, 255},   // ferraille
+        [K_AWNING]  = {196,  70,  58, 255},   // toile rouge
+        [K_CLOTH]   = {110,  60,  50, 255},   // tapis bordeaux
+    };
+    Vector3 center = {(b->min.x + b->max.x) / 2, (b->min.y + b->max.y) / 2,
+                      (b->min.z + b->max.z) / 2};
+    Vector3 size = {b->max.x - b->min.x, b->max.y - b->min.y, b->max.z - b->min.z};
+    int kind = (b->kind >= 0 && b->kind < K_COUNT) ? b->kind : K_WALL;
+    Color c = KIND_COLORS[kind];
+    switch (kind) {
+    case K_BARREL:
+    case K_STONE:
+        if (size.y > 0.3f && fabsf(size.x - size.z) < 0.05f) {
+            // Cylindre vertical : tonneau, colonne, avec ses cerclages
+            float r = size.x / 2;
+            Seg(MatrixIdentity(), (Vector3){center.x, b->min.y, center.z},
+                (Vector3){center.x, b->max.y, center.z}, r, c);
+            if (kind == K_BARREL) {
+                Color hoop = Shade(c, 0.6f);
+                for (int k = 0; k < 2; k++) {
+                    float y = b->min.y + size.y * (0.25f + 0.5f * k);
+                    Seg(MatrixIdentity(), (Vector3){center.x, y - 0.03f, center.z},
+                        (Vector3){center.x, y + 0.03f, center.z}, r * 1.04f, hoop);
+                }
+            }
+            return;
+        }
+        break;
+    case K_SANDBAG: {
+        // Des sacs : une rangée d'ellipsoïdes qui se chevauchent, sur deux lits
+        Color c2 = Shade(c, 0.88f);
+        float along = (size.x >= size.z) ? size.x : size.z;
+        int n = (int)(along / 0.9f) + 1;
+        for (int lit = 0; lit < 2; lit++) {
+            float y = b->min.y + size.y * (lit ? 0.72f : 0.27f);
+            for (int k = 0; k < n; k++) {
+                float t = (n > 1) ? (float)k / (n - 1) : 0.5f;
+                float off = lit ? (0.45f / along) : 0.0f;
+                t = t * (1.0f - 2 * off) + off;
+                Vector3 p = (size.x >= size.z)
+                    ? (Vector3){b->min.x + size.x * t, y, center.z}
+                    : (Vector3){center.x, y, b->min.z + size.z * t};
+                Ball(MatrixIdentity(), p,
+                     (Vector3){(size.x >= size.z) ? 0.55f : size.x / 2,
+                               size.y * 0.3f, (size.x >= size.z) ? size.z / 2 : 0.55f},
+                     (k + lit) % 2 ? c : c2);
+            }
+        }
+        return;
+    }
+    default:
+        break;
+    }
+    Box3(MatrixIdentity(), center, (Vector3){0, 0, 0}, size, c);
+    // Contours : seulement sur les gros volumes (les petits décors en
+    // auraient trop, pour rien)
+    if (size.x * size.y * size.z > 0.5f)
+        DrawCubeWiresV(center, size, Shade(c, 0.55f));
+}
+
 static void DrawMap(void)
 {
     // Sol de l'arène : sable (la carte est inspirée de Dust)
@@ -1085,23 +1157,14 @@ static void DrawMap(void)
                    (Vector3){ARENA_HALF, 0.01f, (float)i}, (Color){170, 146, 100, 255});
     }
     // Les boîtes de la map (les mêmes AABB que celles des collisions : ce
-    // qu'on voit est exactement ce qui bloque). Elles passent par le lot
-    // (Box3) : un seul appel de dessin avec les personnages, et l'ombrage
-    // cuit par face donne du relief aux murs. Couleur selon le rôle :
-    // pisé pour les murs, bois pour les caisses, pierre pour les toits.
-    for (int i = 0; i < MAP_BOX_COUNT; i++) {
-        Box b = MAP_BOXES[i];
-        Vector3 center = {(b.min.x + b.max.x) / 2, (b.min.y + b.max.y) / 2,
-                          (b.min.z + b.max.z) / 2};
-        Vector3 size = {b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z};
-        Color c = (Color){212, 190, 142, 255};                     // pisé
-        if (b.min.y > 0.5f) c = (Color){150, 140, 125, 255};       // toit de tunnel
-        else if (b.max.y <= 2.1f && size.x <= 4.0f && size.z <= 4.0f)
-            c = (Color){156, 118, 72, 255};                        // caisse
-        else if (b.max.y <= 1.7f) c = (Color){196, 172, 128, 255}; // plateau
-        Box3(MatrixIdentity(), center, (Vector3){0, 0, 0}, size, c);
-        DrawCubeWiresV(center, size, (Color){120, 100, 66, 255});
-    }
+    // qu'on voit est exactement ce qui bloque), puis le décor (qui ne
+    // bloque rien). Tout passe par le lot (Box3, Seg, Ball) : un seul
+    // appel de dessin avec les personnages, et l'ombrage cuit par face
+    // donne du relief. Le genre de chaque boîte (BoxKind) choisit la
+    // couleur et la forme : un tonneau ou une colonne est un cylindre, un
+    // tas de sacs de sable un ellipsoïde.
+    for (int i = 0; i < MAP_BOX_COUNT + MAP_DECOR_COUNT; i++)
+        DrawMapBox(i < MAP_BOX_COUNT ? &MAP_BOXES[i] : &MAP_DECOR[i - MAP_BOX_COUNT]);
     // Enseigne reprise du premier jeu : un poussin géant tourne au bout d'un
     // mât planté sur le bloc central, repère visible de toute l'arène.
     // Matrice : échelle x6, rotation autour de Y, puis montée en haut du mât.
@@ -1552,6 +1615,7 @@ static void SetMenu(MenuScreen m)
 //----------------------------------------------------------------------------------
 int main(int argc, char **argv)
 {
+    MapInit();
     OptionsLoad();
     // Ligne de commande (PC) : ./client [ip[:port]] [pseudo] saute l'accueil
     const char *ip_arg = (argc > 1) ? argv[1] : NULL;
