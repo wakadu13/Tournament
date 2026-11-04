@@ -42,6 +42,17 @@ typedef struct {
     int   kills, deaths;
     float shoot_cooldown;
     double last_heard;      // pour le timeout
+
+    // Armes (voir WEAPONS dans game.c). Le serveur tient les chargeurs :
+    // un client modifié ne tire ni plus vite, ni plus fort, ni sans munitions.
+    uint8_t  weapon[WEAPON_SLOTS];  // en main : principale, arme de poing
+    uint8_t  want[WEAPON_SLOTS];    // équipement demandé, appliqué au prochain spawn
+    int      slot;                  // emplacement actif
+    int      mag[WEAPON_SLOTS];     // cartouches dans chaque chargeur
+    int      reserve[WEAPON_SLOTS]; // cartouches en réserve
+    float    reload_t;              // rechargement en cours (s restantes)
+    float    switch_t;              // changement d'arme en cours (s restantes)
+    uint16_t last_shot_seq;         // dernier tir reçu, accepté ou non
 } Player;
 
 static Player   players[MAX_PLAYERS];
@@ -93,6 +104,19 @@ static void BroadcastEvent(EventType ev, int a, int b, int value)
     Broadcast(&p, sizeof(p));
 }
 
+// Remplit les chargeurs et les réserves de l'équipement en main
+static void GiveAmmo(Player *p)
+{
+    for (int k = 0; k < WEAPON_SLOTS; k++) {
+        const WeaponStats *w = &WEAPONS[p->weapon[k]];
+        p->mag[k] = w->mag;
+        p->reserve[k] = w->reserve;
+    }
+    p->slot = SLOT_PRIMARY;
+    p->reload_t = 0.0f;
+    p->switch_t = 0.0f;
+}
+
 static void SpawnPlayer(Player *p)
 {
     int idx = rand() % SPAWNS_PER_TEAM;
@@ -108,6 +132,9 @@ static void SpawnPlayer(Player *p)
     p->alive = true;
     p->spawn_count++;       // invalide les entrées d'avant la mort
     p->shoot_cooldown = 0.0f;
+    // L'équipement choisi pendant la manche précédente entre en jeu ici
+    memcpy(p->weapon, p->want, sizeof(p->weapon));
+    GiveAmmo(p);
 }
 
 static int CountTeam(Team t)
@@ -248,6 +275,10 @@ static void HandleConnect(const PacketConnect *pkt, const struct sockaddr_in *fr
     p->team = team;
     p->is_bot = pkt->is_bot != 0;
     p->last_heard = Now();
+    // Équipement de départ : un poussin zombie n'a que ses griffes ; un
+    // humain part avec le FAMAS et le Glock, et choisira ensuite (PKT_CL_WEAPON).
+    p->want[SLOT_PRIMARY]   = p->is_bot ? WPN_CLAWS : WPN_FAMAS;
+    p->want[SLOT_SECONDARY] = p->is_bot ? WPN_CLAWS : WPN_GLOCK;
     SpawnPlayer(p);
     // En cours de manche, on attend la suivante : posé au spawn mais
     // éliminé d'office, comme dans Counter-Strike. Sinon la manche
@@ -279,12 +310,81 @@ static Player *ValidSender(int id, const struct sockaddr_in *from)
     return p;
 }
 
+// Équipement, changement d'arme, rechargement (PKT_CL_WEAPON)
+static void HandleWeapon(const PacketWeapon *pkt, const struct sockaddr_in *from)
+{
+    Player *p = ValidSender(pkt->player_id, from);
+    if (!p || p->is_bot) return;      // un zombie garde ses griffes
+
+    switch (pkt->action) {
+    case WA_LOADOUT: {
+        if (!WeaponValidPrimary(pkt->a) || !WeaponValidSecondary(pkt->b)) return;
+        p->want[SLOT_PRIMARY] = pkt->a;
+        p->want[SLOT_SECONDARY] = pkt->b;
+        // Comme dans Counter-Strike, on « achète » en début de manche : le
+        // nouvel équipement arrive tout de suite pendant ROUND_BUY_TIME, ou
+        // quand on est mort / entre deux manches. Sinon il attend le
+        // prochain spawn.
+        bool now = !p->alive || round_phase != ROUND_PLAY
+                || (ROUND_TIME - round_timer) < ROUND_BUY_TIME;
+        if (now) {
+            memcpy(p->weapon, p->want, sizeof(p->weapon));
+            GiveAmmo(p);
+        }
+        PacketEvent ev = {PKT_SV_EVENT, EV_LOADOUT, pkt->player_id, 0, now ? 1 : 0};
+        SendTo(from, &ev, sizeof(ev));
+        break;
+    }
+    case WA_SWITCH:
+        if (pkt->a >= WEAPON_SLOTS || pkt->a == p->slot || !p->alive) return;
+        if (p->switch_t > 0.0f) return;
+        p->slot = pkt->a;
+        p->switch_t = WEAPON_SWITCH_TIME;
+        p->reload_t = 0.0f;           // un rechargement en cours est abandonné
+        break;
+    case WA_RELOAD: {
+        if (!p->alive || p->reload_t > 0.0f || p->switch_t > 0.0f) return;
+        const WeaponStats *w = &WEAPONS[p->weapon[p->slot]];
+        if (w->mag == 0 || p->mag[p->slot] >= w->mag || p->reserve[p->slot] <= 0) return;
+        p->reload_t = w->reload;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// Fin de rechargement : on complète le chargeur depuis la réserve
+static void FinishReload(Player *p)
+{
+    const WeaponStats *w = &WEAPONS[p->weapon[p->slot]];
+    int need = w->mag - p->mag[p->slot];
+    if (need > p->reserve[p->slot]) need = p->reserve[p->slot];
+    p->mag[p->slot] += need;
+    p->reserve[p->slot] -= need;
+}
+
+// Nombre aléatoire dans [-1, 1]
+static float Rand11(void) { return (float)rand() / (float)RAND_MAX * 2.0f - 1.0f; }
+
 static void HandleShoot(const PacketShoot *pkt, const struct sockaddr_in *from)
 {
     Player *shooter = ValidSender(pkt->player_id, from);
-    if (!shooter || !shooter->alive || match_over) return;
+    if (!shooter) return;
+    // Accusé de réception du tir, accepté ou non : le client en déduit
+    // combien de ses tirs sont encore en route (affichage des munitions).
+    shooter->last_shot_seq = pkt->shot_seq;
+    if (!shooter->alive || match_over) return;
+    if (pkt->slot != shooter->slot) return;     // le client change d'arme : tir périmé
     if (shooter->shoot_cooldown > 0.0f) return;
-    shooter->shoot_cooldown = WEAPON_COOLDOWN;
+    if (shooter->reload_t > 0.0f || shooter->switch_t > 0.0f) return;
+
+    const WeaponStats *w = &WEAPONS[shooter->weapon[shooter->slot]];
+    if (w->mag > 0) {
+        if (shooter->mag[shooter->slot] <= 0) return;   // chargeur vide
+        shooter->mag[shooter->slot]--;
+    }
+    shooter->shoot_cooldown = w->cooldown;
 
     V3 o = {pkt->ox, pkt->oy, pkt->oz};
     V3 d = {pkt->dx, pkt->dy, pkt->dz};
@@ -310,39 +410,73 @@ static void HandleShoot(const PacketShoot *pkt, const struct sockaddr_in *from)
     float oldest = now_s - (float)(HISTORY_TICKS - 2) / SERVER_TICK_HZ;
     if (view_time < oldest) view_time = oldest;
 
-    float wall_t = RaycastMap(o, d);
-
-    // Joueur le plus proche touché avant un mur, à sa position d'alors
-    int   hit_id = -1;
-    float hit_t = wall_t;
+    // Positions des cibles à cet instant, une fois pour tous les plombs
+    V3   at[MAX_PLAYERS];
+    bool targetable[MAX_PLAYERS];
     for (int i = 0; i < MAX_PLAYERS; i++) {
         Player *t = &players[i];
-        if (!t->active || !t->alive || i == pkt->player_id) continue;
-        if (t->team == shooter->team) continue; // pas de friendly fire
-        V3 at;
-        if (!PositionAt(i, view_time, &at)) at = t->sim.pos;   // pas d'historique : position actuelle
-        float ht;
-        if (RayVsBox(o, d, PlayerBox(at), &ht) && ht > 0.0f && ht < hit_t) {
-            hit_t = ht;
-            hit_id = i;
-        }
+        targetable[i] = t->active && t->alive && i != pkt->player_id && t->team != shooter->team;
+        if (targetable[i] && !PositionAt(i, view_time, &at[i])) at[i] = t->sim.pos;
     }
 
-    if (hit_id < 0) return;
+    // Base orthonormée autour du rayon, pour disperser les plombs
+    V3 r = {d.z, 0, -d.x};
+    float rl = sqrtf(r.x * r.x + r.z * r.z);
+    if (rl < 1e-4f) r = (V3){1, 0, 0}; else { r.x /= rl; r.z /= rl; }
+    V3 u = {r.y * d.z - r.z * d.y, r.z * d.x - r.x * d.z, r.x * d.y - r.y * d.x};
 
-    Player *victim = &players[hit_id];
-    victim->health -= WEAPON_DAMAGE;
-    BroadcastEvent(EV_HIT, pkt->player_id, hit_id, WEAPON_DAMAGE);
+    int  damage[MAX_PLAYERS];
+    bool headshot[MAX_PLAYERS];
+    memset(damage, 0, sizeof(damage));
+    memset(headshot, 0, sizeof(headshot));
 
-    if (victim->health <= 0) {
-        // Éliminé pour toute la manche : pas de respawn. C'est UpdateRound
-        // qui constatera, au prochain tick, qu'une équipe n'a plus personne.
-        victim->alive = false;
-        victim->deaths++;
-        shooter->kills++;
-        BroadcastEvent(EV_KILL, pkt->player_id, hit_id, 0);
-        printf("[*] %s a éliminé %s (survivants : %d ROUGE, %d BLEU)\n",
-               shooter->name, victim->name, CountAlive(TEAM_RED), CountAlive(TEAM_BLUE));
+    for (int pellet = 0; pellet < w->pellets; pellet++) {
+        V3 dir = d;
+        if (w->pellets > 1) {
+            // Gerbe du fusil à pompe : chaque plomb dans un cône
+            float a = Rand11() * 0.035f, b = Rand11() * 0.035f;
+            dir.x += r.x * a + u.x * b; dir.y += r.y * a + u.y * b; dir.z += r.z * a + u.z * b;
+            float l = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+            dir.x /= l; dir.y /= l; dir.z /= l;
+        }
+        float wall_t = RaycastMap(o, dir);
+        // Joueur le plus proche touché avant un mur, à sa position d'alors
+        int   hit_id = -1;
+        float hit_t = wall_t;
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            if (!targetable[i]) continue;
+            float ht;
+            if (RayVsBox(o, dir, PlayerBox(at[i]), &ht) && ht > 0.0f && ht < hit_t) {
+                hit_t = ht;
+                hit_id = i;
+            }
+        }
+        if (hit_id < 0 || hit_t > w->range) continue;   // rien, ou trop loin pour cette arme
+        // Tir à la tête : le point d'impact est dans les 30 cm du haut
+        float hit_y = o.y + dir.y * hit_t - at[hit_id].y;
+        bool head = hit_y >= HEADSHOT_HEIGHT;
+        damage[hit_id] += head ? (int)(w->damage * HEADSHOT_MULT) : w->damage;
+        if (head) headshot[hit_id] = true;
+    }
+
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (damage[i] <= 0) continue;
+        Player *victim = &players[i];
+        victim->health -= damage[i];
+        BroadcastEvent(EV_HIT, pkt->player_id, i, damage[i]);
+
+        if (victim->health <= 0) {
+            // Éliminé pour toute la manche : pas de respawn. C'est UpdateRound
+            // qui constatera, au prochain tick, qu'une équipe n'a plus personne.
+            victim->alive = false;
+            victim->deaths++;
+            shooter->kills++;
+            BroadcastEvent(EV_KILL, pkt->player_id, i,
+                           (int)shooter->weapon[shooter->slot] | (headshot[i] ? 0x100 : 0));
+            printf("[*] %s a éliminé %s (%s%s ; survivants : %d ROUGE, %d BLEU)\n",
+                   shooter->name, victim->name, w->name, headshot[i] ? ", tête" : "",
+                   CountAlive(TEAM_RED), CountAlive(TEAM_BLUE));
+        }
     }
 }
 
@@ -379,6 +513,7 @@ static void ApplyInputs(Player *p, const PacketClientInput *pkt)
         float m2 = c.move_x * c.move_x + c.move_y * c.move_y;
         if (m2 > 1.0f) { float inv = 1.0f / sqrtf(m2); c.move_x *= inv; c.move_y *= inv; }
 
+        c.speed_mult = WEAPONS[p->weapon[p->slot]].move_mult;   // arme lourde ou légère
         PlayerStep(&p->sim, &c, dt);
         p->yaw = e->yaw;
         p->pitch = e->pitch;
@@ -433,6 +568,11 @@ static void HandlePacket(const uint8_t *buf, sock_ssize_t len, const struct sock
             HandleShoot((const PacketShoot *)buf, from);
         break;
 
+    case PKT_CL_WEAPON:
+        if (len >= (sock_ssize_t)sizeof(PacketWeapon))
+            HandleWeapon((const PacketWeapon *)buf, from);
+        break;
+
     case PKT_CL_DISCONNECT:
         if (len >= (sock_ssize_t)sizeof(PacketDisconnect)) {
             const PacketDisconnect *pkt = (const PacketDisconnect *)buf;
@@ -476,6 +616,14 @@ static void SendSnapshot(void)
         s->vx = p->sim.vel.x; s->vz = p->sim.vel.z; s->vy = p->sim.vel_y;
         s->on_ground = p->sim.on_ground ? 1 : 0;
         s->last_seq = p->last_seq;
+        for (int k = 0; k < WEAPON_SLOTS; k++) {
+            s->weapon[k] = p->weapon[k];
+            s->mag[k] = (uint8_t)(p->mag[k] < 0 ? 0 : (p->mag[k] > 255 ? 255 : p->mag[k]));
+            s->reserve[k] = (uint16_t)(p->reserve[k] < 0 ? 0 : p->reserve[k]);
+        }
+        s->slot = (uint8_t)p->slot;
+        s->reload_t = p->reload_t > 0.0f ? p->reload_t : 0.0f;
+        s->last_shot_seq = p->last_shot_seq;
         memcpy(s->name, p->name, NAME_MAX);
     }
     Broadcast(&snap, sizeof(snap));
@@ -501,7 +649,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("Serveur TDM démarré sur le port %d (tick %d Hz)\n", port, SERVER_TICK_HZ);
+    printf("Serveur démarré sur le port %d (tick %d Hz, carte %.0f x %.0f m, %d armes)\n",
+           port, SERVER_TICK_HZ, 2 * ARENA_HALF, 2 * ARENA_HALF, WPN_COUNT - 1);
 
     const double tick_dt = 1.0 / SERVER_TICK_HZ;
     const double snap_dt = 1.0 / SNAPSHOT_HZ;
@@ -543,6 +692,11 @@ int main(int argc, char **argv)
                     continue;
                 }
                 if (p->shoot_cooldown > 0.0f) p->shoot_cooldown -= dt;
+                if (p->switch_t > 0.0f) p->switch_t -= dt;
+                if (p->reload_t > 0.0f) {
+                    p->reload_t -= dt;
+                    if (p->reload_t <= 0.0f) { p->reload_t = 0.0f; FinishReload(p); }
+                }
             }
             UpdateRound(dt);
         }

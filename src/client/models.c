@@ -19,6 +19,8 @@
 #include "raymath.h"
 
 #include "models.h"
+#include "../common/protocol.h"
+#include "weapons.h"
 
 // Raccourci pour un Vector3 littéral. ATTENTION : on ne peut pas l'appeler
 // V3 comme dans le premier jeu, game.h utilise déjà ce nom pour un TYPE.
@@ -521,7 +523,7 @@ void DrawChick(Matrix parent, float t, float flap)
 // injectés de sang, cheveux ras, rangers, démarche de zombie bras tendus
 // vers l'avant. Les épaulettes et le brassard prennent la couleur de
 // l'équipe pour reconnaître amis et ennemis d'un coup d'œil.
-void DrawSoldier(Vector3 pos, float yaw, const CharAnim *an, Color team_color)
+void DrawSoldier(Vector3 pos, float yaw, const CharAnim *an, Color team_color, int weapon)
 {
     // Palette (reprise du premier jeu)
     const Color UNIFORM = {88, 96, 68, 255};     // treillis olive
@@ -593,13 +595,49 @@ void DrawSoldier(Vector3 pos, float yaw, const CharAnim *an, Color team_color)
          P3(0.215f + breathe * 1.5f, 0.2f, 0.14f + breathe * 2.0f), UNIFORM);
     Ball(body, P3(0, 1.48f, 0), P3(0.25f, 0.09f, 0.13f), UNIFORM);
 
-    // --- Bras tendus vers l'avant, démarche de zombie (comme le premier
-    // jeu) : ils balancent doucement en opposition à la marche ---
+    // --- L'arme, épaulée devant la poitrine. Son repère a le canon vers
+    // -Z et le soldat regarde vers +Z : on la retourne, on la pose un peu
+    // à droite, et chaque coup (attack) la fait reculer vers l'épaule. Les
+    // mains vont se poser sur sa poignée et son garde-main. ---
+    bool armed = (weapon >= 0 && weapon < WPN_CLAWS);
+    float rec = an->attack * live;
+    Matrix gun = MatrixMultiply(
+        MatrixMultiply(MatrixRotateY(PI), MatrixRotateX(-0.08f + rec * 0.1f)),
+        MatrixTranslate(0.11f, 1.3f + sw * 0.01f, 0.26f - rec * 0.05f));
+    if (armed) {
+        WeaponPose wp = {0};
+        wp.muzzle = (an->attack > 0.85f) ? 1.0f : 0.0f;   // flash juste au coup
+        wp.bolt = rec;
+        DrawWeaponModel(MatrixMultiply(gun, body), weapon, &wp);
+    }
+    Vector3 grip_r = {0.21f, 1.44f, 0.54f}, grip_l = {-0.21f, 1.44f, 0.54f};
+    if (armed) {
+        Vector3 r, l;
+        WeaponGrips(weapon, &r, &l);
+        grip_r = Vector3Transform(r, gun);
+        grip_l = Vector3Transform(l, gun);
+    }
+
+    // --- Bras : sur l'arme s'il en a une, sinon tendus vers l'avant,
+    // démarche de zombie (comme le premier jeu), balançant doucement en
+    // opposition à la marche ---
     for (int k = -1; k <= 1; k += 2) {
         float s = sw * k;
         Vector3 shoulder = {0.235f * k, 1.47f, 0};
-        Vector3 elbow = {0.26f * k, 1.42f + s * 0.02f, 0.27f + s * 0.04f};
-        Vector3 hand = {0.21f * k, 1.44f + s * 0.05f, 0.54f + s * 0.06f};
+        Vector3 hand, elbow;
+        if (armed) {
+            // Le bras du côté +X (celui de la crosse, l'arme étant décalée
+            // en +X) tient la poignée ; l'autre tient le garde-main.
+            hand = (k > 0) ? grip_r : grip_l;
+            // Le coude tombe sous la ligne épaule-main, vers l'extérieur
+            elbow = Vector3Lerp(shoulder, hand, 0.5f);
+            elbow.x += 0.1f * k;
+            elbow.y -= 0.13f;
+            elbow.z -= 0.03f;
+        } else {
+            elbow = (Vector3){0.26f * k, 1.42f + s * 0.02f, 0.27f + s * 0.04f};
+            hand = (Vector3){0.21f * k, 1.44f + s * 0.05f, 0.54f + s * 0.06f};
+        }
         // Manche retroussée : treillis jusqu'à 82 % du coude, revers roulé
         Vector3 cuff = Vector3Lerp(shoulder, elbow, 0.82f);
         Limb(body, shoulder, cuff, 0.062f, UNIFORM);

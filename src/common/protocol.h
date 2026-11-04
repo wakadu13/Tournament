@@ -11,7 +11,11 @@
 // v3 : manches a elimination. Plus de respawn pendant une manche ; une
 // equipe sans survivant perd la manche ; le snapshot porte la manche, sa
 // phase et son chrono.
-#define PROTO_VERSION   3
+// v4 : plusieurs armes. Le joueur choisit un equipement (arme principale +
+// arme de poing), change d'arme et recharge par PKT_CL_WEAPON ; le serveur
+// tient les chargeurs et les reserves, applique degats, cadence, portee et
+// plombs de l'arme ACTIVE, et relaie l'arme de chacun dans le snapshot.
+#define PROTO_VERSION   4
 #define DEFAULT_PORT    7777
 
 #define MAX_PLAYERS     16
@@ -43,6 +47,7 @@ typedef enum {
     PKT_CL_INPUT,           // entrees du joueur (deplacement, vue, saut...)
     PKT_CL_SHOOT,           // tir (origine + direction + instant vu)
     PKT_CL_DISCONNECT,      // départ propre
+    PKT_CL_WEAPON,          // equipement, changement d'arme, rechargement
 
     // Serveur -> Client
     PKT_SV_ACCEPT = 100,    // connexion acceptée (id + équipe)
@@ -58,7 +63,7 @@ typedef enum {
 } Team;
 
 typedef enum {
-    EV_KILL = 1,        // a = tueur, b = victime
+    EV_KILL = 1,        // a = tueur, b = victime, value = arme (WeaponId), ou -1 si tir a la tete
     EV_HIT,             // a = tireur, b = touché, value = dégâts
     EV_RESPAWN,         // a = joueur
     EV_PLAYER_JOIN,     // a = joueur
@@ -66,6 +71,7 @@ typedef enum {
     EV_MATCH_OVER,      // a = équipe gagnante
     EV_ROUND_START,     // a = numéro de manche
     EV_ROUND_END,       // a = équipe gagnante (TEAM_COUNT = manche nulle), b = numéro
+    EV_LOADOUT,         // a = joueur, value = 1 si applique tout de suite, 0 si a la prochaine manche
 } EventType;
 
 // Phase de la manche en cours
@@ -74,6 +80,42 @@ typedef enum {
     ROUND_PLAY,         // manche en cours
     ROUND_END,          // manche finie, pause avant la suivante
 } RoundPhase;
+
+// --- Armes ----------------------------------------------------------------
+// Les statistiques (degats, cadence, chargeur, dispersion...) sont dans la
+// table WEAPONS de game.c, partagee par le serveur et le client.
+typedef enum {
+    WPN_FAMAS = 0,      // FAMAS F1 : fusil d'assaut bullpup, 5,56 mm
+    WPN_HK416,          // HK416 : fusil d'assaut, 5,56 mm
+    WPN_M4A1,           // M4A1 : carabine, 5,56 mm
+    WPN_AK74,           // AK-74M : fusil d'assaut, 5,45 mm
+    WPN_MP5,            // HK MP5 : pistolet-mitrailleur, 9 mm
+    WPN_FRF2,           // FR-F2 : fusil de precision a verrou, 7,62 mm
+    WPN_BENELLI,        // Benelli M3 : fusil a pompe, calibre 12
+    WPN_GLOCK,          // Glock 17 : pistolet, 9 mm (arme de poing)
+    WPN_PAMAS,          // PAMAS G1 : pistolet, 9 mm (arme de poing)
+    WPN_CLAWS,          // griffes des poussins zombies (bots) : ni chargeur ni portee
+    WPN_COUNT
+} WeaponId;
+
+// Mode de tir
+typedef enum {
+    FIRE_AUTO = 0,      // tant que le bouton est maintenu
+    FIRE_SEMI,          // un coup par pression
+    FIRE_BOLT,          // un coup par pression, puis rearmement (verrou)
+    FIRE_PUMP,          // un coup par pression, puis pompe
+} FireMode;
+
+// Actions de PKT_CL_WEAPON
+typedef enum {
+    WA_LOADOUT = 0,     // a = arme principale, b = arme de poing
+    WA_SWITCH,          // a = emplacement (0 = principale, 1 = poing)
+    WA_RELOAD,
+} WeaponAction;
+
+#define WEAPON_SLOTS    2
+#define SLOT_PRIMARY    0
+#define SLOT_SECONDARY  1
 
 #pragma pack(push, 1)
 
@@ -132,6 +174,9 @@ typedef struct {
 typedef struct {
     uint8_t  type;          // PKT_CL_SHOOT
     uint8_t  player_id;
+    uint8_t  slot;          // emplacement de l'arme avec laquelle le client croit tirer
+    uint8_t  pad;
+    uint16_t shot_seq;      // numero du tir, +1 par tir : le serveur en accuse reception (last_shot_seq)
     float    ox, oy, oz;    // origine du rayon (caméra)
     float    dx, dy, dz;    // direction normalisée
     float    view_time;     // instant serveur (s) que le tireur VOYAIT (voir INTERP_DELAY)
@@ -141,6 +186,13 @@ typedef struct {
     uint8_t type;           // PKT_CL_DISCONNECT
     uint8_t player_id;
 } PacketDisconnect;
+
+typedef struct {
+    uint8_t type;           // PKT_CL_WEAPON
+    uint8_t player_id;
+    uint8_t action;         // WeaponAction
+    uint8_t a, b;           // selon l'action
+} PacketWeapon;
 
 // Un joueur dans un snapshot
 typedef struct {
@@ -162,6 +214,14 @@ typedef struct {
     float    vy;            // vitesse verticale
     uint8_t  on_ground;
     uint16_t last_seq;      // dernière entrée traitée par le serveur
+    // Armes : ce que chacun tient (pour le dessiner), et pour le joueur
+    // LOCAL l'etat de ses chargeurs.
+    uint8_t  weapon[WEAPON_SLOTS];  // WeaponId par emplacement
+    uint8_t  slot;                  // emplacement actif
+    uint8_t  mag[WEAPON_SLOTS];     // cartouches dans chaque chargeur
+    uint16_t reserve[WEAPON_SLOTS]; // cartouches en reserve
+    float    reload_t;              // secondes de rechargement restantes (0 = pas en cours)
+    uint16_t last_shot_seq;         // dernier tir recu (accuse ou non) : voir PacketShoot
     char     name[NAME_MAX];
 } SnapshotPlayer;
 

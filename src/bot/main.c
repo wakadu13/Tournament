@@ -7,8 +7,10 @@
  * protocole UDP), mais sans raylib ni affichage : parfait pour tester le
  * jeu tout seul. Comportement de zombie :
  *   - il repère le joueur ennemi vivant le plus proche,
- *   - il marche vers lui en ligne droite (plus lentement qu'un joueur),
- *     en glissant le long des obstacles grâce aux collisions partagées,
+ *   - s'il le voit, il marche droit sur lui (plus lentement qu'un joueur) ;
+ *     sinon il suit les POINTS DE PASSAGE de la carte (NAV_NODES, game.c) :
+ *     du nœud le plus proche de lui au nœud le plus proche de sa proie, par
+ *     le chemin le plus court en nombre d'étapes,
  *   - s'il reste coincé contre un mur, il saute et fait un pas de côté,
  *   - arrivé au corps-à-corps, il "griffe" : techniquement c'est un tir
  *     (PKT_CL_SHOOT) à bout portant vers la poitrine de la cible, mais
@@ -70,6 +72,12 @@ static uint32_t last_pos_tick = 0; // tick de last_pos : on mesure entre deux sn
 static float stuck_time = 0.0f;    // depuis combien de temps on est coincé
 static float dodge_time = 0.0f;    // temps restant de pas de côté
 static int   dodge_side = 1;       // -1 = gauche, +1 = droite
+
+// Chemin en cours sur les points de passage (indices dans NAV_NODES)
+#define PATH_MAX 64
+static int   path[PATH_MAX];
+static int   path_len = 0, path_i = 0;
+static float path_age = 99.0f;     // secondes depuis le dernier calcul
 
 // Horloge monotone de la boucle du bot (voir platform.h)
 static double Now(void) { return PlatformNow(); }
@@ -161,8 +169,10 @@ static void NetSendInputs(void)
 
 static void NetSendAttack(V3 origin, V3 dir)
 {
+    static uint16_t shot_seq = 0;
     PacketShoot pkt = {
         PKT_CL_SHOOT, (uint8_t)my_id,
+        SLOT_PRIMARY, 0, ++shot_seq,        // les griffes sont l'arme « principale »
         origin.x, origin.y, origin.z,
         dir.x, dir.y, dir.z,
         (float)pos_tick / SERVER_TICK_HZ,   // on vise ce que montrait le dernier snapshot
@@ -227,6 +237,56 @@ static SnapshotPlayer *NearestEnemy(float *dist_out)
     return best;
 }
 
+//----------------------------------------------------------------------------------
+// Points de passage
+//----------------------------------------------------------------------------------
+// Voit-on b depuis a (à hauteur d'yeux, à travers la carte) ?
+static bool CanSee(V3 a, V3 b)
+{
+    V3 o = {a.x, a.y + PLAYER_EYE_HEIGHT, a.z};
+    V3 d = {b.x - a.x, (b.y + 1.0f) - o.y, b.z - a.z};
+    float len = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+    if (len < 0.01f) return true;
+    d.x /= len; d.y /= len; d.z /= len;
+    return RaycastMap(o, d) >= len - 0.05f;
+}
+
+// Nœud le plus proche de p, visible depuis p si possible
+static int NearestNode(V3 p)
+{
+    int best = 0, best_vis = -1;
+    float bd = 1e9f, bdv = 1e9f;
+    for (int i = 0; i < NAV_NODE_COUNT; i++) {
+        float dx = NAV_NODES[i].pos.x - p.x, dz = NAV_NODES[i].pos.z - p.z;
+        float d = dx * dx + dz * dz;
+        if (d < bd) { bd = d; best = i; }
+        if (d < bdv && CanSee(p, NAV_NODES[i].pos)) { bdv = d; best_vis = i; }
+    }
+    return best_vis >= 0 ? best_vis : best;
+}
+
+// Chemin le plus court (en étapes) de from à to : parcours en largeur
+static void FindPath(int from, int to)
+{
+    int prev[64], queue[64], head = 0, tail = 0;
+    for (int i = 0; i < NAV_NODE_COUNT && i < 64; i++) prev[i] = -2;
+    prev[from] = -1;
+    queue[tail++] = from;
+    while (head < tail && prev[to] == -2) {
+        int n = queue[head++];
+        for (int k = 0; k < 6 && NAV_NODES[n].links[k] >= 0; k++) {
+            int j = NAV_NODES[n].links[k];
+            if (j < 64 && prev[j] == -2) { prev[j] = n; queue[tail++] = j; }
+        }
+    }
+    path_len = 0;
+    if (prev[to] == -2) return;                 // inatteignable
+    int tmp[PATH_MAX], n = 0;
+    for (int c = to; c != -1 && n < PATH_MAX; c = prev[c]) tmp[n++] = c;
+    for (int i = n - 1; i >= 0; i--) path[path_len++] = tmp[i];   // dans l'ordre
+    path_i = 0;
+}
+
 // Un pas de simulation du zombie (appelé ZOMBIE_TICK_HZ fois par seconde)
 static void ZombieThink(float dt)
 {
@@ -241,19 +301,43 @@ static void ZombieThink(float dt)
     SnapshotPlayer *target = NearestEnemy(&dist);
     if (!target) { PushInput(dt, 0, 0, false); return; }   // personne à chasser : planté là
 
-    // Il regarde sa proie : le déplacement est relatif à yaw, donc
-    // « en avant » = vers elle
-    V3 to_target = {target->x - pos.x, 0, target->z - pos.z};
-    float len = sqrtf(to_target.x * to_target.x + to_target.z * to_target.z);
-    if (len > 0.001f) { to_target.x /= len; to_target.z /= len; }
-    yaw = atan2f(to_target.x, to_target.z);
+    // --- Où aller : droit sur la proie si on la voit, sinon vers le
+    // prochain point de passage du chemin qui y mène. ---
+    V3 tpos = {target->x, target->y, target->z};
+    V3 goal = tpos;
+    bool sees = CanSee(pos, tpos);
+    path_age += dt;
+    if (!sees) {
+        if (path_age > 1.0f || path_len == 0) {
+            path_age = 0.0f;
+            FindPath(NearestNode(pos), NearestNode(tpos));
+        }
+        // On avance d'un nœud dès qu'on est dessus (ou qu'on voit le suivant)
+        while (path_i < path_len) {
+            V3 n = NAV_NODES[path[path_i]].pos;
+            float dx = n.x - pos.x, dz = n.z - pos.z;
+            if (dx * dx + dz * dz < 2.5f * 2.5f) { path_i++; continue; }
+            if (path_i + 1 < path_len && CanSee(pos, NAV_NODES[path[path_i + 1]].pos)) { path_i++; continue; }
+            break;
+        }
+        if (path_i < path_len) goal = NAV_NODES[path[path_i]].pos;
+    } else {
+        path_len = 0;
+    }
 
-    // --- Déplacement : droit sur la cible, sauf pendant un pas de côté
+    // Il regarde sa proie s'il la voit, sinon là où il va : le déplacement
+    // est relatif à yaw, donc « en avant » = vers son but
+    V3 to_goal = {goal.x - pos.x, 0, goal.z - pos.z};
+    float glen = sqrtf(to_goal.x * to_goal.x + to_goal.z * to_goal.z);
+    if (glen > 0.001f) { to_goal.x /= glen; to_goal.z /= glen; }
+    yaw = atan2f(to_goal.x, to_goal.z);
+
+    // --- Déplacement : vers le but, sauf pendant un pas de côté
     // (anti-blocage). Le serveur applique PLAYER_SPEED x longueur du
     // déplacement : on envoie ZOMBIE_SPEED / PLAYER_SPEED pour rester lent.
     // On s'arrête un peu avant le contact pour ne pas pousser la cible. ---
     float mx = 0.0f, my = 0.0f;
-    if (dist > ZOMBIE_ATTACK_RANGE * 0.7f) {
+    if (!sees || dist > ZOMBIE_ATTACK_RANGE * 0.7f) {
         float k = ZOMBIE_SPEED / PLAYER_SPEED;
         if (dodge_time > 0.0f) { dodge_time -= dt; mx = k * (float)dodge_side; }   // pas de côté
         else my = k;
@@ -288,7 +372,7 @@ static void ZombieThink(float dt)
     // --- Griffe : à portée et cooldown écoulé. L'attaque part de nos
     // yeux vers la poitrine de la cible (comme un tir à bout portant,
     // c'est le serveur qui vérifie et applique les dégâts). ---
-    if (dist < ZOMBIE_ATTACK_RANGE && attack_cd <= 0.0f) {
+    if (sees && dist < ZOMBIE_ATTACK_RANGE && attack_cd <= 0.0f) {
         attack_cd = ZOMBIE_ATTACK_CD;
         V3 eye = {pos.x, pos.y + PLAYER_EYE_HEIGHT, pos.z};
         V3 chest = {target->x, target->y + 1.0f, target->z};

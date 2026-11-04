@@ -125,8 +125,9 @@ void CharAnimLookAt(CharAnim *a, Vector3 self, float yaw, Vector3 target, bool h
 // Les modèles
 //----------------------------------------------------------------------------------
 // Le soldat-mercenaire : les JOUEURS humains (treillis olive, visage peint
-// en vert, démarche de zombie bras tendus).
-void DrawSoldier(Vector3 pos, float yaw, const CharAnim *a, Color team_color);
+// en vert). weapon = WeaponId de l'arme qu'il tient (voir weapons.h) ;
+// sans arme valide, il marche bras tendus comme un zombie.
+void DrawSoldier(Vector3 pos, float yaw, const CharAnim *a, Color team_color, int weapon);
 
 // Le poussin zombie : les BOTS (poussin humanoïde d'1m60 ensanglanté).
 void DrawZombieChick(Vector3 pos, float yaw, const CharAnim *a, Color team_color);

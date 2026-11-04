@@ -44,8 +44,10 @@ endif
 
 COMMON_SRC = src/common/game.c
 COMMON_HDR = src/common/protocol.h src/common/game.h src/common/platform.h
-CLIENT_SRC = src/client/main.c src/client/models.c src/client/touch.c
-CLIENT_HDR = src/client/models.h src/client/touch.h
+CLIENT_SRC = src/client/main.c src/client/models.c src/client/weapons.c src/client/touch.c \
+             src/client/ui.c src/client/menu.c src/client/options.c
+CLIENT_HDR = src/client/models.h src/client/weapons.h src/client/touch.h \
+             src/client/ui.h src/client/menu.h src/client/options.h
 
 all: $(BUILD)/server$(EXE) $(BUILD)/client$(EXE) $(BUILD)/bot$(EXE)
 

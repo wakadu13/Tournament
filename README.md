@@ -2,7 +2,10 @@
 
 FPS multijoueur en C avec [raylib](https://www.raylib.com/) : deux équipes
 (rouge vs bleue) s'affrontent par **manches à élimination**, comme dans
-Counter-Strike, sur une carte inspirée de **Dust**.
+Counter-Strike, sur une carte de **120 × 120 m inspirée de Dust 2**, avec
+**neuf armes** (FAMAS, HK416, M4A1, AK-74M, MP5, FR-F2, Benelli M3, Glock 17,
+PAMAS G1) à choisir dans le **menu d'équipement**, et un **menu d'options**
+(sensibilité, champ de vision, plein écran...) gardé d'une partie à l'autre.
 
 ## Le mode de jeu
 
@@ -23,18 +26,30 @@ le chrono au centre, et un point par survivant sous chaque score.
 
 ## La carte
 
-Inspirée de Dust, ramenée à une arène de 60 × 60 m faite de boîtes
-(`MAP_BOXES` dans [src/common/game.c](src/common/game.c)). Les T (bleus)
-partent au sud, les CT (rouges) au nord, et trois chemins les relient :
+Inspirée de Dust 2, à l'échelle d'une vraie carte de Counter-Strike :
+**120 × 120 m**, faite de boîtes alignées sur les axes (`MAP_BOXES` dans
+[src/common/game.c](src/common/game.c)). Les T (bleus) partent au sud, les
+CT (rouges) au nord, et trois voies relient les deux camps vers les deux
+**sites** (A au nord-est, B au nord-ouest) :
 
 | Voie | Description |
 |---|---|
-| **Mid** | au centre, deux piliers « double doors » et le pilier de l'enseigne, avec un passage de chaque côté ; deux caisses basses |
-| **Long A** | à l'est, un couloir de 10 m longé d'un mur, qui débouche au nord sur le site A et ses caisses |
-| **Tunnels B** | à l'ouest, un couloir étroit et **couvert** (un toit à 3,2 m laisse passer les joueurs mais bloque les tirs en cloche) vers le site B |
+| **Mid** | couloir central de 20 m de large, coupé par les « doubles portes » (deux piliers, passage de 6 m) ; au sud, l'enseigne au poussin et la caisse « xbox » servent de couverture ; au nord, il débouche sur le spawn CT |
+| **Long A** | à l'est, un couloir de 12 m de large et 58 m de long, fermé au sud par les « long doors » (passage de 4 m), qui débouche au nord sur le **site A** |
+| **Catwalk** | du haut de mid vers le site A, un couloir de 6 m |
+| **Tunnels** | à l'ouest, les tunnels **hauts** longent l'enceinte sous un toit (il laisse passer un joueur mais bloque les tirs en cloche) jusqu'au **site B** ; les tunnels **bas** les relient à mid à travers le bloc ouest, sous un toit eux aussi |
+| **Connecteur** | du haut de mid vers le site B, un couloir de 6 m |
+| **B doors** | du spawn CT au site B, une porte de 4 m |
 
-Les voies restent assez ouvertes pour que les bots, qui marchent droit et
-contournent grossièrement, s'y retrouvent.
+Les sites ont un **plateau** à 1,60 m (deux marches de 0,80 m : un saut monte
+à 1 m) et des caisses ; les spawns et les couloirs ont des couvertures
+basses. Toutes les voies font au moins 4 m de large.
+
+Les bots suivent des **points de passage** (`NAV_NODES`, 25 nœuds reliés
+quand on peut marcher droit de l'un à l'autre) : un zombie qui ne voit pas
+sa proie cherche le chemin le plus court sur ce graphe et le suit, puis
+fonce dès qu'il l'aperçoit. Un harnais vérifie que les spawns sont
+dégagés, que chaque lien est praticable et que le graphe est connexe.
 
 Les joueurs humains incarnent des **soldats-mercenaires** (treillis olive,
 visage peint en vert, yeux injectés de sang, démarche bras tendus) ; les
@@ -42,17 +57,64 @@ bots sont des **poussins zombies** humanoïdes ensanglantés, tout droit
 sortis d'un film d'horreur. Épaulettes, brassards et colliers prennent la
 couleur de l'équipe.
 
+## Les armes
+
+Neuf armes d'armée conventionnelle, décrites dans la table `WEAPONS` de
+[src/common/game.c](src/common/game.c) (partagée : le serveur applique
+dégâts, cadence, portée, chargeur et plombs ; le client s'en sert pour la
+dispersion, le recul, le HUD et le menu). Chaque joueur part avec une
+**arme principale** et une **arme de poing** (touches 1 / 2, molette, ou le
+bouton d'arme sur Android) :
+
+| Arme | Catégorie | Tir | Dégâts | Cadence | Portée | Chargeur |
+|---|---|---|---|---|---|---|
+| **FAMAS F1** | fusil d'assaut (bullpup) | automatique | 22 | 1000 cpm | 150 m | 25 + 75 |
+| **HK416** | fusil d'assaut | automatique | 26 | 850 cpm | 160 m | 30 + 90 |
+| **M4A1** | carabine | automatique | 25 | 800 cpm | 150 m | 30 + 90 |
+| **AK-74M** | fusil d'assaut | automatique | 31 | 650 cpm | 150 m | 30 + 90 |
+| **HK MP5** | pistolet-mitrailleur | automatique | 18 | 800 cpm | 60 m | 30 + 120 |
+| **FR-F2** | fusil de précision | à verrou, lunette | 100 | 40 cpm | 300 m | 10 + 30 |
+| **Benelli M3** | fusil à pompe | à pompe | 8 × 12 | 67 cpm | 25 m | 7 + 28 |
+| **Glock 17** | pistolet (poing) | coup par coup | 20 | 500 cpm | 60 m | 17 + 51 |
+| **PAMAS G1** | pistolet (poing) | coup par coup | 24 | 430 cpm | 60 m | 15 + 45 |
+
+- Un **tir à la tête** (dans les 30 cm du haut) fait **×2**. Les fusils
+  d'assaut tuent en 4 balles au corps, le FR-F2 d'une seule.
+- **Rechargement** (R) : la réserve remplit le chargeur, en 1,6 à 3,2 s
+  selon l'arme ; à vide, l'arme recharge seule (option désactivable).
+  **Changement d'arme** : 0,45 s pendant lesquelles on ne tire pas.
+- L'**équipement** se choisit dans le menu (B, ou le menu pause) : comme
+  dans Counter-Strike, il s'applique **tout de suite pendant les 20
+  premières secondes d'une manche** (`ROUND_BUY_TIME`), quand on est mort
+  ou entre deux manches ; sinon il attend la prochaine manche.
+- Le serveur **tient les chargeurs** : un client modifié ne tire ni plus
+  vite, ni plus fort, ni sans munitions, ni avec l'arme qu'il n'a pas en
+  main. Chaque tir porte un numéro que le serveur accuse dans le snapshot
+  (`last_shot_seq`) : le client affiche ses munitions moins ses tirs
+  encore en route, sans jamais « sauter ».
+- Le fusil à pompe tire huit plombs par coup, dispersés par le serveur ;
+  l'arme pèse sur la vitesse (le MP5 et les pistolets rendent plus
+  rapide, le FR-F2 plus lent), ce que le client et le serveur simulent
+  à l'identique.
+
+Les bots (poussins zombies) n'ont que leurs **griffes** : 25 dégâts à
+2,5 m, sans munitions.
+
 ## Architecture
 
 ```
 src/
 ├── common/           Code partagé par les trois programmes
 │   ├── protocol.h    Protocole réseau UDP (paquets, constantes)
-│   └── game.h/.c     Règles, map (AABB), collisions, raycasts
+│   └── game.h/.c     Règles, armes, map (AABB), points de passage, collisions, raycasts
 │   └── platform.h    Sockets, horloge et sleep : Windows / Linux / macOS / Android
 ├── server/main.c     Serveur dédié headless (autoritaire)
-├── client/main.c     Client raylib (vue FPS, prédiction, HUD)
+├── client/main.c     Client raylib (vue FPS, prédiction, HUD, boucle des menus)
 ├── client/models.c   Modèles 3D procéduraux + animation (voir plus bas)
+├── client/weapons.c  Modèles 3D des neuf armes (vue subjective et dans les mains des soldats)
+├── client/menu.c     Accueil, pause, équipement, options
+├── client/ui.c       Widgets immédiats (boutons, curseurs, champs, clavier à l'écran)
+├── client/options.c  Réglages persistants (options.cfg)
 ├── client/touch.c    Commandes tactiles (Android)
 └── bot/main.c        Bot zombie headless (pour le dev et le test)
 
@@ -90,9 +152,15 @@ scripts/              build_android.sh (APK sans Gradle)
 
 - Arme dessinée en « view model » : passe 3D séparée en espace vue, elle
   ne rentre jamais dans les murs. Balancement de marche, sway (l'arme
-  traîne derrière la souris), recul (kick) et flash de bouche.
+  traîne derrière la souris), recul (kick) et flash de bouche, et les
+  animations de rechargement (l'arme bascule, le chargeur sort),
+  de changement d'arme (elle descend puis remonte) et de réarmement
+  (verrou du FR-F2, pompe du Benelli, glissière des pistolets).
 - Visée (clic droit) : zoom de FOV, sensibilité réduite, point rouge du
-  viseur au centre de l'écran, dispersion minimale.
+  viseur au centre de l'écran, dispersion minimale. Chaque arme a sa
+  ligne de visée à la même hauteur dans son repère (`WEAPON_SIGHT_Y`) :
+  le viseur tombe au centre quelle que soit l'arme. Le FR-F2 vise dans
+  une **lunette** plein écran (FOV 12°).
 - Sprint (Maj + avant) : FOV élargi, arme baissée, tir impossible.
 - Dispersion réaliste : précise en visant, imprécise en courant, en
   sautant ou en rafale (bloom) — le réticule s'écarte pour la montrer.
@@ -198,7 +266,7 @@ exécutables des quatre plateformes, compilés par la CI
 Avant d'être publié, **l'APK est lancé dans un émulateur Android** par la
 CI (`scripts/android_smoke_test.sh`) : le jeu doit démarrer, initialiser
 l'affichage, puis **se connecter en UDP à un serveur qui tourne sur la
-machine hôte** — l'adresse est tapée sur le pavé numérique de l'écran
+machine hôte** — l'adresse est tapée sur le clavier à l'écran du menu
 d'accueil, comme le ferait un joueur. Les captures d'écran de chaque étape
 sont dans les artefacts du run (`captures-android`). Un APK qui ne démarre
 pas, ou qui ne joint pas le serveur, bloque la release.
@@ -405,9 +473,9 @@ Mesuré sur le protocole réel (`src/common/protocol.h`) :
 
 | | Valeur |
 |---|---|
-| Taille d'un snapshot | **1 019 octets** (16 emplacements de 63 octets + en-tête) |
+| Taille d'un snapshot | **1 266 octets** (16 emplacements de 78 octets, armes et munitions comprises, + en-tête) |
 | Fréquence d'envoi | 20 Hz (`SNAPSHOT_HZ`) |
-| Montant serveur, 16 joueurs | 1 019 × 20 × 16 ≈ **326 ko/s, soit 2,6 Mbit/s** |
+| Montant serveur, 16 joueurs | 1 266 × 20 × 16 ≈ **405 ko/s, soit 3,2 Mbit/s** |
 | Montant par client | 148 octets (8 entrées) × 30 Hz ≈ **4,4 ko/s** |
 | Tick de simulation | 60 Hz, un seul fil d'exécution ; les entrées sont rejouées à leur arrivée |
 | Historique pour les tirs | 64 ticks ≈ 1 s de positions, pour tous les joueurs |
@@ -504,18 +572,40 @@ Spectrum](https://developers.cloudflare.com/spectrum/get-started/),
 Workers](https://developers.cloudflare.com/workers/runtime-apis/websockets/),
 [Durable Objects](https://www.cloudflare.com/products/durable-objects/).
 
+## Menus et options
+
+Le client s'ouvre sur un **écran d'accueil** : adresse du serveur
+(`hôte[:port]`), pseudo, **JOUER**, **ARMES** (choix de l'équipement, avec
+les caractéristiques et un aperçu 3D de chaque arme), **OPTIONS**,
+**QUITTER**. En jeu, **Échap** ouvre le menu pause (reprendre, armes,
+options, quitter la partie) et **B** ouvre directement l'équipement.
+
+Les options : sensibilité souris, sensibilité au doigt (Android), champ
+de vision (60 à 100°), inversion de l'axe vertical, plein écran (PC),
+affichage des FPS, rechargement automatique. Avec le dernier serveur, le
+pseudo et l'équipement choisi, elles sont écrites dans **`options.cfg`**
+(texte `clé=valeur`), à côté de l'exécutable sur PC et dans le dossier
+privé de l'application sur Android. Un fichier absent ou abîmé donne
+simplement les valeurs par défaut.
+
+Sur PC, `client <adresse[:port]> [pseudo]` saute l'accueil et se connecte
+directement (pratique pour les scripts et les tests).
+
 ## Contrôles
 
 | Touche | Action |
 |---|---|
 | W / A / S / D | Se déplacer (position physique des touches : ZQSD en AZERTY) |
 | Souris | Viser |
-| Clic gauche | Tirer (automatique maintenu) |
-| Clic droit | Viser (zoom) |
+| Clic gauche | Tirer (maintenu pour les armes automatiques, un clic par coup sinon) |
+| Clic droit | Viser (zoom ; lunette avec le FR-F2) |
+| R | Recharger |
+| 1 / 2, molette | Arme principale / arme de poing |
+| B | Choisir son équipement |
 | Maj gauche | Sprint (en avançant) |
 | Espace | Sauter |
 | Tab | Tableau des scores |
-| Échap | Quitter |
+| Échap | Menu pause |
 
 ### Sur Android
 
@@ -524,17 +614,20 @@ deux points (tout est derrière `MOBILE_UI` dans
 [src/client/main.c](src/client/main.c) et `TOUCH_ENABLED` dans
 [src/client/touch.c](src/client/touch.c)) :
 
-- **Écran d'accueil** : l'adresse du serveur se tape sur un pavé numérique
-  (le `:` permet de viser un autre port, par ex. `192.168.1.20:27015`),
-  puis **CONNECTER**. Sur PC l'adresse reste un argument de la ligne de
-  commande.
+- **Écran d'accueil** : l'adresse du serveur et le pseudo se tapent sur un
+  **clavier à l'écran** (chiffres, AZERTY, point, deux-points, tiret,
+  effacement ; le `:` permet de viser un autre port, par ex.
+  `192.168.1.20:27015`), puis **JOUER**. Les menus ARMES et OPTIONS sont
+  les mêmes que sur PC.
 - **Commandes tactiles**, reprises du premier jeu :
   - 40 % gauche de l'écran : **joystick virtuel**, il apparaît sous le doigt
     là où on se pose ; poussé à fond vers l'avant il déclenche le **sprint** ;
   - partout ailleurs : **glisser pour viser** ;
   - boutons ronds en bas à droite : **TIRER** (on peut viser en glissant
     depuis ce bouton, donc tirer et viser du même pouce), **VISER**
-    (bascule) et **SAUT**.
+    (bascule), **SAUT**, **RECH.** (recharger) et le bouton d'arme, qui
+    affiche les munitions de l'arme en main et **change d'arme** ;
+  - en haut à gauche : **MENU** (pause, armes, options).
 
   Chaque doigt reçoit un rôle au moment où il se pose et le garde jusqu'à ce
   qu'il soit levé : on peut se déplacer, viser et tirer à trois doigts.
@@ -546,21 +639,24 @@ coup par `BeginMode2D` : il garde la même taille relative d'un téléphone à
 une tablette.
 
 Pour régler tout ça **sans téléphone**, compilez avec
-`-DTOUCH_CONTROLS=1` : l'écran d'accueil et les commandes tactiles
+`-DTOUCH_CONTROLS=1` : le clavier à l'écran et les commandes tactiles
 s'activent sur PC, la souris jouant le rôle du doigt.
 
 ## Réglages de gameplay
 
-Tout est dans [src/common/game.h](src/common/game.h) : dégâts, cadence,
-vitesse, gravité, durée d'une manche, manches gagnantes... et la map elle-même
-dans [src/common/game.c](src/common/game.c) (liste de boîtes `MAP_BOXES`).
+Tout est dans [src/common/game.h](src/common/game.h) : vitesse, gravité,
+durée d'une manche, manches gagnantes, temps d'achat, multiplicateur des
+tirs à la tête... La map (liste de boîtes `MAP_BOXES`), les points de
+passage des bots (`NAV_NODES`) et la table des armes (`WEAPONS` : dégâts,
+cadence, portée, chargeur, dispersion, recul) sont dans
+[src/common/game.c](src/common/game.c).
 Les réglages de la vue FPS (FOV, sensibilité, accélérations) sont en tête
 de [src/client/main.c](src/client/main.c).
 
 ## Pistes pour la suite
 
-- Plusieurs armes, munitions, rechargement
 - Sons (tirs, hits, cris de poussin)
-- Chat texte, et menu de connexion in-game sur PC (il existe déjà sur Android)
+- Chat texte
+- Grenades, et un vrai pathfinding pour les bots (aujourd'hui : points de passage)
 - Delta-compression des snapshots, pour dépasser 16 joueurs
 - Signature de release de l'APK (aujourd'hui signé avec la clé de debug)

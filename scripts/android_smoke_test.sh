@@ -1,7 +1,7 @@
 #!/bin/bash
 # Test de fumee sur emulateur Android : installe l'APK, lance le jeu, tape
-# l'adresse du serveur sur le pave numerique, se connecte, tire, et
-# enregistre captures d'ecran + journaux.
+# l'adresse du serveur sur le clavier a l'ecran du menu d'accueil, se
+# connecte (JOUER), tire, et enregistre captures d'ecran + journaux.
 #
 # C'est un VRAI test de bout en bout, pas seulement « l'application
 # demarre » : le serveur tourne sur la machine hote de la CI, et le client
@@ -106,20 +106,21 @@ echo "ecran vu par le jeu : ${W}x${H}"
 ux() { phys_x $(( W/2 + $1 * H / 720 )); }
 uy() { phys_y $(( $1 * H / 720 )); }
 
-# Pave numerique de MobileConnectScreen : 3 colonnes de 112 unites
-# espacees de 12, a partir de (centre - 180) ; 4 lignes de 78 espacees de
-# 12, a partir de y = 236. Centre d'une touche (colonne, ligne) :
-#   x = centre - 180 + colonne*124 + 56      y = 236 + ligne*90 + 39
+# Clavier a l'ecran du menu d'accueil (UiKeyboard, client/menu.c) : 10
+# colonnes de 100 unites espacees de 8, a partir de (centre - 536) ; 4
+# lignes de 62 espacees de 8, a partir de y = 196. Centre d'une touche
+# (colonne, ligne) :
+#   x = centre - 536 + colonne*108 + 50      y = 196 + ligne*70 + 31
+# Le champ « Serveur » a le focus au demarrage : les touches y vont.
 key() {
-    press "$(ux $(( -180 + $1 * 124 + 56 )))" "$(uy $(( 236 + $2 * 90 + 39 )))"
+    press "$(ux $(( -536 + $1 * 108 + 50 )))" "$(uy $(( 196 + $2 * 70 + 31 )))"
     sleep 0.5
 }
-# Effacement : bouton a droite du champ (champ : centre-200..centre+200, y 150..212 ;
-# bouton : +12 apres le champ, 76 de large) -> centre a (centre+250, 181)
-erase() { press "$(ux 250)" "$(uy 181)"; sleep 0.4; }
-# Disposition :  1 2 3 / 4 5 6 / 7 8 9 / . 0 :
-# "10.0.2.2" = 1(0,0)  0(1,3)  .(0,3)  0(1,3)  .(0,3)  2(1,0)  .(0,3)  2(1,0)
-type_address() { key 0 0; key 1 3; key 0 3; key 1 3; key 0 3; key 1 0; key 0 3; key 1 0; }
+# Effacement : la touche « < », derniere de la derniere ligne
+erase() { key 9 3; }
+# Disposition : 1234567890 / AZERTYUIOP / QSDFGHJKLM / WXCVBN.:-<
+# "10.0.2.2" = 1(0,0)  0(9,0)  .(6,3)  0(9,0)  .(6,3)  2(1,0)  .(6,3)  2(1,0)
+type_address() { key 0 0; key 9 0; key 6 3; key 9 0; key 6 3; key 1 0; key 6 3; key 1 0; }
 typed() { adb logcat -d -s raylib | grep -o 'adresse "[^"]*"' | tail -1 | tr -d '"' | sed 's/adresse //'; }
 
 type_address
@@ -137,8 +138,8 @@ done
 echo "adresse composee : $(typed)"
 adb exec-out screencap -p > "$OUT/android-2-adresse.png"
 
-# CONNECTER : bouton de 280 x 78 centre en x, a y = 236 + 4*90 + 14 + 39 = 649
-press "$(ux 0)" "$(uy 649)"
+# JOUER : bouton de 300 x 64 centre en x, a y = 490 (centre : 522)
+press "$(ux 0)" "$(uy 522)"
 sleep 12                         # connexion + premieres images de jeu
 adb exec-out screencap -p > "$OUT/android-3-jeu.png"
 

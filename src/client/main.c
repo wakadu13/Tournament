@@ -44,7 +44,11 @@
 #include "../common/protocol.h"
 #include "../common/game.h"
 #include "models.h"   // modèles 3D des personnages (soldat / poussin zombie)
+#include "weapons.h"  // modèles 3D des armes
 #include "touch.h"    // commandes tactiles (mobile) et structure PlayerInput
+#include "options.h"  // réglages persistants (options.cfg)
+#include "ui.h"       // widgets des menus
+#include "menu.h"     // accueil, pause, équipement, options
 
 //----------------------------------------------------------------------------------
 // Réglages de la vue FPS
@@ -52,7 +56,7 @@
 #define SCREEN_W 1280
 #define SCREEN_H 720
 
-#define MOUSE_SENSITIVITY 0.0025f  // radians par pixel de souris
+#define MOUSE_SENSITIVITY 0.0025f  // radians par pixel de souris (x options.sensitivity)
 
 // Interface mobile : écran de connexion au doigt et commandes tactiles.
 // Même interrupteur que TOUCH_ENABLED dans touch.c, pour que les deux
@@ -100,10 +104,12 @@ static Camera2D UiCamera(void)
 }
 
 // Champ de vision (degrés) selon la situation. La valeur réelle rejoint
-// la cible en douceur à chaque frame (pas de saut brutal).
-#define FOV_HIP    75.0f           // normal, arme à la hanche
-#define FOV_ADS    50.0f           // en visant : effet de zoom
-#define FOV_SPRINT 84.0f           // en sprint : impression de vitesse
+// la cible en douceur à chaque frame (pas de saut brutal). La base est
+// réglable (options.fov) ; la visée zoome de 25°, la lunette bien plus.
+#define FOV_HIP    (options.fov)             // normal, arme à la hanche
+#define FOV_ADS    (options.fov - 25.0f)     // en visant : effet de zoom
+#define FOV_SCOPE  12.0f                     // dans la lunette du FR-F2
+#define FOV_SPRINT (options.fov + 9.0f)      // en sprint : impression de vitesse
 
 
 #define KILLFEED_MAX   5
@@ -217,6 +223,33 @@ static float hit_marker_timer = 0.0f;    // réticule rouge quand on touche
 static float damage_flash_timer = 0.0f;  // voile rouge quand on est touché
 
 //----------------------------------------------------------------------------------
+// Armes (côté client)
+//----------------------------------------------------------------------------------
+// Le serveur tient les chargeurs (voir server/main.c). Ici on garde ce
+// qu'il nous a dit au dernier snapshot, moins nos tirs encore en route,
+// et des minuteurs LOCAUX de rechargement / changement d'arme pour
+// l'animation et pour ne pas tirer dans le vide (le serveur les refuserait).
+static int      my_weapon[WEAPON_SLOTS] = { WPN_FAMAS, WPN_GLOCK };  // ce qu'on tient
+static int      my_slot = SLOT_PRIMARY;      // emplacement actif
+static int      my_mag[WEAPON_SLOTS];        // cartouches affichées (snapshot - tirs en route)
+static int      my_reserve[WEAPON_SLOTS];
+static uint16_t my_shot_seq = 0;             // numéro de notre dernier tir
+static float    reload_t = 0.0f;             // rechargement local (s restantes)
+static float    reload_total = 1.0f;         // sa durée, pour l'animation
+static float    switch_t = 0.0f;             // changement d'arme local (s restantes)
+static float    bolt_t = 0.0f;               // réarmement (verrou, pompe, glissière) : 1 -> 0
+static bool     fire_was_down = false;       // front du bouton de tir (coup par coup)
+static char     weapon_msg[96] = "";         // « équipement appliqué » ...
+static float    weapon_msg_t = 0.0f;
+static bool     scoped = false;              // dans la lunette (FR-F2 en visée)
+
+// Menu ouvert en jeu (pause, armes, options) ; MENU_NONE = on joue
+static MenuScreen menu = MENU_NONE;
+static bool       quit_requested = false;
+
+static const WeaponStats *CurWeapon(void) { return &WEAPONS[my_weapon[my_slot]]; }
+
+//----------------------------------------------------------------------------------
 // Effets : fil des kills et traçantes
 //----------------------------------------------------------------------------------
 typedef struct {
@@ -292,16 +325,18 @@ static bool NetConnect(const char *ip, const char *name)
         sendto(sock_fd, &pkt, sizeof(pkt), 0,
                (struct sockaddr *)&server_addr, sizeof(server_addr));
 
-        // On écoute la réponse pendant une demi-seconde
-        double deadline = GetTime() + 0.5;
-        while (GetTime() < deadline) {
+        // On écoute la réponse pendant une demi-seconde. PlatformNow et
+        // pas GetTime : sur PC on peut se connecter AVANT d'ouvrir la
+        // fenêtre, et l'horloge de raylib ne démarre qu'avec elle.
+        double deadline = PlatformNow() + 0.5;
+        while (PlatformNow() < deadline) {
             uint8_t buf[2048];
             sock_ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
             if (n >= (sock_ssize_t)sizeof(PacketAccept) && buf[0] == PKT_SV_ACCEPT) {
                 PacketAccept *acc = (PacketAccept *)buf;
                 my_id = acc->player_id;       // le serveur nous donne notre slot
                 my_team = (Team)acc->team;    // et notre équipe (auto-équilibrage)
-                last_server_msg = GetTime();
+                last_server_msg = -1.0;       // posé à la première image de jeu
                 printf("Connecté : id %d, équipe %s\n", my_id,
                        my_team == TEAM_RED ? "ROUGE" : "BLEUE");
                 return true;
@@ -344,10 +379,20 @@ static void NetSendShoot(V3 origin, V3 dir)
 {
     PacketShoot pkt = {
         PKT_CL_SHOOT, (uint8_t)my_id,
+        (uint8_t)my_slot, 0, ++my_shot_seq,   // l'arme avec laquelle on tire, et le numéro du tir
         origin.x, origin.y, origin.z,
         dir.x, dir.y, dir.z,
         view_time,                 // l'instant qu'on voyait : le serveur y rembobine les cibles
     };
+    sendto(sock_fd, &pkt, sizeof(pkt), 0,
+           (struct sockaddr *)&server_addr, sizeof(server_addr));
+}
+
+// Équipement, changement d'arme, rechargement : le serveur fait autorité
+// (voir HandleWeapon côté serveur), on anime en attendant sa réponse.
+static void NetSendWeapon(int action, int a, int b)
+{
+    PacketWeapon pkt = { PKT_CL_WEAPON, (uint8_t)my_id, (uint8_t)action, (uint8_t)a, (uint8_t)b };
     sendto(sock_fd, &pkt, sizeof(pkt), 0,
            (struct sockaddr *)&server_addr, sizeof(server_addr));
 }
@@ -371,10 +416,14 @@ static void HandleEvent(const PacketEvent *ev)
 {
     char line[64];
     switch (ev->event) {
-    case EV_KILL:
-        snprintf(line, sizeof(line), "%s a éliminé %s",
-                 PlayerName(ev->a), PlayerName(ev->b));
+    case EV_KILL: {
+        int w = ev->value & 0xFF;
+        bool head = (ev->value & 0x100) != 0;
+        snprintf(line, sizeof(line), "%s a éliminé %s (%s%s)",
+                 PlayerName(ev->a), PlayerName(ev->b),
+                 (w >= 0 && w < WPN_COUNT) ? WEAPONS[w].name : "?", head ? ", tête" : "");
         KillfeedPush(line);
+    }
         if (ev->a == my_id) hit_marker_timer = 0.3f;   // c'est nous le tueur
         // Le tueur porte son coup. La victime, elle, s'effondre dès que le
         // snapshot la donne pour morte (CharAnimUpdate s'en charge).
@@ -411,6 +460,11 @@ static void HandleEvent(const PacketEvent *ev)
         break;
     case EV_PLAYER_LEAVE:
         KillfeedPush("un joueur est parti");
+        break;
+    case EV_LOADOUT:
+        snprintf(weapon_msg, sizeof(weapon_msg), ev->value
+                 ? "Équipement appliqué" : "Équipement prêt pour la prochaine manche");
+        weapon_msg_t = 3.0f;
         break;
     default:
         break;
@@ -454,10 +508,28 @@ static void NetReceive(void)
                     pending_head = 0;        // tout ce qui précède est périmé
                     pending_count = 0;
                     dead_t = 0.0f;
+                    // Nouvel équipement en main, arme principale, rien en cours
+                    my_slot = me->slot;
+                    reload_t = switch_t = bolt_t = 0.0f;
                 } else if (me->alive) {
                     Reconcile(me);
                 }
                 my_alive = me->alive != 0;
+                // Armes : ce que le serveur nous donne, moins les tirs qu'il
+                // n'a pas encore vus (différence signée : gère le bouclage)
+                for (int k = 0; k < WEAPON_SLOTS; k++) {
+                    my_weapon[k] = me->weapon[k];
+                    my_mag[k] = me->mag[k];
+                    my_reserve[k] = me->reserve[k];
+                }
+                int in_flight = (int16_t)(my_shot_seq - me->last_shot_seq);
+                if (in_flight > 0 && WEAPONS[my_weapon[my_slot]].mag > 0) {
+                    my_mag[my_slot] -= in_flight;
+                    if (my_mag[my_slot] < 0) my_mag[my_slot] = 0;
+                }
+                // Le serveur a fini de recharger avant nous (ou ne l'a jamais
+                // commencé) : on s'aligne
+                if (me->reload_t <= 0.0f && reload_t > 0.0f && reload_t < 0.2f) reload_t = 0.0f;
                 // La vie a baissé depuis le dernier snapshot : voile rouge
                 if (me->health < last_health) damage_flash_timer = 0.25f;
                 last_health = me->health;
@@ -499,8 +571,9 @@ static V3 EyePos(void)
 // Le réticule du HUD s'écarte avec cette même valeur.
 static float WeaponSpread(void)
 {
+    const WeaponStats *w = CurWeapon();
     float hspeed = sqrtf(my_sim.vel.x * my_sim.vel.x + my_sim.vel.z * my_sim.vel.z);
-    return Lerp(0.022f, 0.002f, ads)
+    return Lerp(w->spread_hip, w->spread_ads, ads)
          + hspeed * 0.003f
          + (my_sim.on_ground ? 0.0f : 0.04f)
          + bloom;
@@ -559,23 +632,46 @@ static Vector3 ViewToWorld(Vector3 v)
     };
 }
 
-// Bout du canon en espace vue (le -0.62 correspond au modèle de l'arme)
+// Bout du canon en espace vue (dépend du modèle de l'arme)
 static Vector3 MuzzleView(void)
 {
-    return Vector3Transform((Vector3){0, 0.02f, -0.62f}, WeaponViewMatrix());
+    return Vector3Transform(WeaponMuzzle(my_weapon[my_slot]), WeaponViewMatrix());
 }
 
-// Tire une balle : recul, flash, dispersion, envoi au serveur et traçante.
+// Une traçante (purement visuelle) de notre canon jusqu'au premier
+// obstacle dans la direction dir : mur, ou joueur affiché.
+static void TracerFrom(V3 eye, Vector3 d)
+{
+    V3 dir = {d.x, d.y, d.z};
+    float t = RaycastMap(eye, dir);
+    if (t > CurWeapon()->range) t = CurWeapon()->range;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        SnapshotPlayer *sp = &snap.players[i];
+        if (!sp->active || !sp->alive || i == my_id) continue;
+        float ht;
+        V3 ppos = {display_pos[i].x, display_pos[i].y, display_pos[i].z};
+        if (RayVsBox(eye, dir, PlayerBox(ppos), &ht) && ht > 0 && ht < t) t = ht;
+    }
+    Vector3 to = {eye.x + dir.x * t, eye.y + dir.y * t, eye.z + dir.z * t};
+    TracerAdd(ViewToWorld(MuzzleView()), to);
+}
+
+// Tire un coup avec l'arme en main : recul, flash, dispersion, envoi au
+// serveur et traçante(s). Le serveur décide des dégâts.
 static void Shoot(void)
 {
-    shoot_cooldown = WEAPON_COOLDOWN;
+    const WeaponStats *w = CurWeapon();
+    shoot_cooldown = w->cooldown;
     muzzle_t = 0.05f;              // flash de bouche pendant 50 ms
-    kick = 1.0f;                   // animation de recul de l'arme
+    kick = (w->pellets > 1 || w->mode == FIRE_BOLT) ? 1.6f : 1.0f;   // recul visuel, plus fort sur les grosses armes
     // Le canon monte (moins en visant) et dévie un peu au hasard. Il
     // redescend tout seul (décroissance dans UpdateViewEffects).
-    recoil_pitch += Randf(0.010f, 0.016f) * (1.0f - ads * 0.35f);
-    recoil_yaw += Randf(-0.006f, 0.006f);
-    bloom = fminf(bloom + 0.006f, 0.04f);   // rafale = moins précis (plafonné)
+    recoil_pitch += Randf(w->recoil * 0.8f, w->recoil * 1.2f) * (1.0f - ads * 0.35f);
+    recoil_yaw += Randf(-w->recoil * 0.5f, w->recoil * 0.5f);
+    bloom = fminf(bloom + w->recoil * 0.6f, 0.04f);   // rafale = moins précis (plafonné)
+    if (w->mag > 0 && my_mag[my_slot] > 0) my_mag[my_slot]--;   // en attendant le snapshot
+    if (w->mode == FIRE_BOLT || w->mode == FIRE_PUMP) bolt_t = 1.0f;   // réarmement animé
+    else if (w->mode == FIRE_SEMI) bolt_t = 0.6f;                      // glissière du pistolet
 
     // Direction du tir = regard (recul compris) + dispersion aléatoire dans
     // un cône : on décale la direction dans le plan perpendiculaire (r, u).
@@ -592,21 +688,49 @@ static void Shoot(void)
     });
 
     V3 eye = EyePos();
-    V3 dir = {d.x, d.y, d.z};
-    NetSendShoot(eye, dir);        // le serveur décide des dégâts
+    NetSendShoot(eye, (V3){d.x, d.y, d.z});
 
-    // Traçante locale (purement visuelle) : du canon visible jusqu'au
-    // premier obstacle (mur ou joueur affiché).
-    float t = RaycastMap(eye, dir);
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        SnapshotPlayer *sp = &snap.players[i];
-        if (!sp->active || !sp->alive || i == my_id) continue;
-        float ht;
-        V3 ppos = {display_pos[i].x, display_pos[i].y, display_pos[i].z};
-        if (RayVsBox(eye, dir, PlayerBox(ppos), &ht) && ht > 0 && ht < t) t = ht;
+    // Traçantes : une par balle, ou une gerbe pour le fusil à pompe (le
+    // serveur tire ses propres plombs : la gerbe affichée est indicative)
+    if (w->pellets <= 1) {
+        TracerFrom(eye, d);
+    } else {
+        for (int i = 0; i < w->pellets; i++) {
+            float a = Randf(-0.035f, 0.035f), b = Randf(-0.035f, 0.035f);
+            Vector3 pd = Vector3Normalize((Vector3){
+                d.x + r.x * a + u.x * b, d.y + r.y * a + u.y * b, d.z + r.z * a + u.z * b});
+            TracerFrom(eye, pd);
+        }
     }
-    Vector3 to = {eye.x + dir.x * t, eye.y + dir.y * t, eye.z + dir.z * t};
-    TracerAdd(ViewToWorld(MuzzleView()), to);
+}
+
+// Changement d'arme : local tout de suite (animation, arme affichée), et
+// le serveur suit. Pendant WEAPON_SWITCH_TIME on ne peut pas tirer.
+static void SwitchWeapon(int slot)
+{
+    if (slot == my_slot || slot < 0 || slot >= WEAPON_SLOTS || switch_t > 0.0f) return;
+    my_slot = slot;
+    switch_t = WEAPON_SWITCH_TIME + 0.05f;    // un peu plus que le serveur : il refuserait un tir trop tôt
+    reload_t = 0.0f;
+    bolt_t = 0.0f;
+    NetSendWeapon(WA_SWITCH, slot, 0);
+}
+
+static void StartReload(void)
+{
+    const WeaponStats *w = CurWeapon();
+    if (reload_t > 0.0f || switch_t > 0.0f || w->mag == 0) return;
+    if (my_mag[my_slot] >= w->mag || my_reserve[my_slot] <= 0) return;
+    reload_total = w->reload;
+    reload_t = w->reload + 0.05f;
+    NetSendWeapon(WA_RELOAD, 0, 0);
+}
+
+// Envoie l'équipement choisi dans les options ; le serveur dira s'il
+// s'applique tout de suite ou à la prochaine manche (EV_LOADOUT).
+static void SendLoadout(void)
+{
+    NetSendWeapon(WA_LOADOUT, options.primary, options.secondary);
 }
 
 //----------------------------------------------------------------------------------
@@ -627,12 +751,19 @@ static void UpdateLocalPlayer(float dt)
     // On ne la lit donc que sur PC : sur mobile, visee et boutons viennent
     // uniquement de touch.c.
 #if !MOBILE_UI
-    float sens = MOUSE_SENSITIVITY * (1.0f - ads * 0.35f);
+    float sens = MOUSE_SENSITIVITY * options.sensitivity * (1.0f - ads * 0.35f) * (scoped ? 0.4f : 1.0f);
     Vector2 md = GetMouseDelta();
     in.look.x = -md.x * sens;
     in.look.y = -md.y * sens;
     in.fire = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    in.fire_pressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     in.aim  = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+    in.reload = IsKeyPressed(KEY_R);
+    // Changement d'arme : molette, ou 1 / 2 (positions des touches)
+    float wheel = GetMouseWheelMove();
+    if (wheel != 0.0f) in.swap = true;
+    if (IsKeyPressed(KEY_ONE)) SwitchWeapon(SLOT_PRIMARY);
+    if (IsKeyPressed(KEY_TWO)) SwitchWeapon(SLOT_SECONDARY);
 #endif
 
     // --- Clavier : direction voulue. KEY_* correspond à la POSITION des
@@ -648,6 +779,9 @@ static void UpdateLocalPlayer(float dt)
 
     // --- Doigts : s'ajoutent aux commandes ci-dessus (sans effet sur PC) ---
     TouchApply(&in, ads);
+    if (in.swap) SwitchWeapon(my_slot == SLOT_PRIMARY ? SLOT_SECONDARY : SLOT_PRIMARY);
+    if (in.reload) StartReload();
+    if (options.invert_y) in.look.y = -in.look.y;
 
     // En diagonale la longueur vaudrait ~1.41 : on la ramène à 1 pour ne
     // pas se déplacer plus vite en biais.
@@ -680,6 +814,7 @@ static void UpdateLocalPlayer(float dt)
     e.yaw = my_yaw;
     e.pitch = my_pitch;
     PlayerCmd cmd = CmdFromEntry(&e);
+    cmd.speed_mult = CurWeapon()->move_mult;   // comme le serveur : l'arme pèse
     PlayerStep(&my_sim, &cmd, e.dt);      // collisions et gravité : code partagé
     PendingPush(&e);
 
@@ -687,13 +822,26 @@ static void UpdateLocalPlayer(float dt)
     float hspeed = sqrtf(my_sim.vel.x * my_sim.vel.x + my_sim.vel.z * my_sim.vel.z);
     if (my_sim.on_ground) bob += dt * hspeed * 1.6f;
 
-    // --- Tir : automatique tant que le bouton est maintenu, à la cadence
-    // WEAPON_COOLDOWN, et jamais pendant un sprint ---
+    // --- Tir : selon le mode de l'arme (automatique tant que le bouton est
+    // maintenu, ou un coup par pression), à sa cadence, jamais pendant un
+    // sprint, un rechargement ou un changement d'arme, et chargeur non vide ---
+    const WeaponStats *w = CurWeapon();
     if (shoot_cooldown > 0.0f) shoot_cooldown -= dt;
-    if (firing && !sprinting && shoot_cooldown <= 0.0f) Shoot();
+    bool trigger = (w->mode == FIRE_AUTO) ? firing : (firing && !fire_was_down) || in.fire_pressed;
+    fire_was_down = firing;
+    bool can_fire = !sprinting && shoot_cooldown <= 0.0f && reload_t <= 0.0f && switch_t <= 0.0f;
+    if (trigger && can_fire) {
+        if (w->mag == 0 || my_mag[my_slot] > 0) Shoot();
+        else if (options.auto_reload) StartReload();
+    }
+    // Chargeur vide et plus personne n'appuie : on recharge aussi
+    if (options.auto_reload && w->mag > 0 && my_mag[my_slot] == 0 && my_reserve[my_slot] > 0
+        && reload_t <= 0.0f && switch_t <= 0.0f && shoot_cooldown <= 0.0f)
+        StartReload();
 
     // --- Transitions douces de la visée et du sprint (0 -> 1) ---
     ads += ((aiming && !sprinting ? 1.0f : 0.0f) - ads) * fminf(1.0f, dt * 14.0f);
+    scoped = WeaponHasScope(my_weapon[my_slot]) && ads > 0.9f;
     sprint_t += ((sprinting ? 1.0f : 0.0f) - sprint_t) * fminf(1.0f, dt * 10.0f);
 
     // --- Sway : l'arme traîne légèrement derrière la souris ---
@@ -708,6 +856,10 @@ static void UpdateLocalPlayer(float dt)
 static void UpdateViewEffects(float dt)
 {
     kick = fmaxf(0, kick - dt * 12.0f);
+    if (reload_t > 0.0f) reload_t -= dt;
+    if (switch_t > 0.0f) switch_t -= dt;
+    if (bolt_t > 0.0f) bolt_t = fmaxf(0, bolt_t - dt * 2.2f);
+    if (weapon_msg_t > 0.0f) weapon_msg_t -= dt;
     recoil_pitch -= recoil_pitch * fminf(1.0f, dt * 6.0f);
     recoil_yaw -= recoil_yaw * fminf(1.0f, dt * 6.0f);
     bloom = fmaxf(0, bloom - dt * 0.08f);
@@ -910,7 +1062,7 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
     cam->projection = CAMERA_PERSPECTIVE;
 
     // FOV cible selon la situation, rejoint en douceur
-    float fov = Lerp(FOV_HIP, FOV_ADS, ads);
+    float fov = Lerp(FOV_HIP, WeaponHasScope(my_weapon[my_slot]) ? FOV_SCOPE : FOV_ADS, ads);
     fov = Lerp(fov, FOV_SPRINT, sprint_t);
     *fov_current += (fov - *fov_current) * fminf(1.0f, dt * 14.0f);
     cam->fovy = *fov_current;
@@ -921,26 +1073,33 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
 //----------------------------------------------------------------------------------
 static void DrawMap(void)
 {
-    // Sol de l'arène
-    // Sable : la carte est inspirée de Dust
+    // Sol de l'arène : sable (la carte est inspirée de Dust)
     DrawPlane((Vector3){0, 0, 0},
               (Vector2){ARENA_HALF * 2, ARENA_HALF * 2},
               (Color){186, 160, 112, 255});
-    // Quadrillage léger tous les 5 m (donne une échelle visuelle)
-    for (int i = -(int)ARENA_HALF; i <= (int)ARENA_HALF; i += 5) {
+    // Quadrillage léger tous les 10 m (donne une échelle visuelle)
+    for (int i = -(int)ARENA_HALF; i <= (int)ARENA_HALF; i += 10) {
         DrawLine3D((Vector3){(float)i, 0.01f, -ARENA_HALF},
                    (Vector3){(float)i, 0.01f, ARENA_HALF}, (Color){170, 146, 100, 255});
         DrawLine3D((Vector3){-ARENA_HALF, 0.01f, (float)i},
                    (Vector3){ARENA_HALF, 0.01f, (float)i}, (Color){170, 146, 100, 255});
     }
-    // Les boîtes de la map (les mêmes AABB que celles des collisions :
-    // ce qu'on voit est exactement ce qui bloque)
+    // Les boîtes de la map (les mêmes AABB que celles des collisions : ce
+    // qu'on voit est exactement ce qui bloque). Elles passent par le lot
+    // (Box3) : un seul appel de dessin avec les personnages, et l'ombrage
+    // cuit par face donne du relief aux murs. Couleur selon le rôle :
+    // pisé pour les murs, bois pour les caisses, pierre pour les toits.
     for (int i = 0; i < MAP_BOX_COUNT; i++) {
         Box b = MAP_BOXES[i];
         Vector3 center = {(b.min.x + b.max.x) / 2, (b.min.y + b.max.y) / 2,
                           (b.min.z + b.max.z) / 2};
         Vector3 size = {b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z};
-        DrawCubeV(center, size, (Color){212, 190, 142, 255});    // murs et caisses couleur pisé
+        Color c = (Color){212, 190, 142, 255};                     // pisé
+        if (b.min.y > 0.5f) c = (Color){150, 140, 125, 255};       // toit de tunnel
+        else if (b.max.y <= 2.1f && size.x <= 4.0f && size.z <= 4.0f)
+            c = (Color){156, 118, 72, 255};                        // caisse
+        else if (b.max.y <= 1.7f) c = (Color){196, 172, 128, 255}; // plateau
+        Box3(MatrixIdentity(), center, (Vector3){0, 0, 0}, size, c);
         DrawCubeWiresV(center, size, (Color){120, 100, 66, 255});
     }
     // Enseigne reprise du premier jeu : un poussin géant tourne au bout d'un
@@ -956,9 +1115,9 @@ static void DrawMap(void)
                              MatrixTranslate(0, 5.0f, 0)), t, 0.2f);
 
     // Marquage au sol des zones de spawn de chaque équipe
-    DrawCircle3D((Vector3){0, 0.02f, -26}, 4, (Vector3){1, 0, 0}, 90,
+    DrawCircle3D((Vector3){0, 0.02f, -51}, 8, (Vector3){1, 0, 0}, 90,
                  Fade(TeamColor(TEAM_RED), 0.4f));
-    DrawCircle3D((Vector3){0, 0.02f, 26}, 4, (Vector3){1, 0, 0}, 90,
+    DrawCircle3D((Vector3){0, 0.02f, 51}, 8, (Vector3){1, 0, 0}, 90,
                  Fade(TeamColor(TEAM_BLUE), 0.4f));
 }
 
@@ -979,7 +1138,8 @@ static void DrawPlayers(void)
         Color col = TeamColor(sp->team);
 
         if (sp->is_bot) DrawZombieChick(p, display_yaw[i], &anim[i], col);
-        else            DrawSoldier(p, display_yaw[i], &anim[i], col);
+        else            DrawSoldier(p, display_yaw[i], &anim[i], col,
+                                    sp->weapon[sp->slot < WEAPON_SLOTS ? sp->slot : 0]);
 
         // Ombre "pastille" du premier jeu : elle se resserre quand il saute
         // et s'étale quand il est couché.
@@ -992,64 +1152,17 @@ static void DrawPlayers(void)
     }
 }
 
-// Modèle du fusil, décrit dans le repère de l'ARME : origine au boîtier,
-// canon vers -Z, +Y vers le haut. Construit avec des formes simples.
-// Dessiné via la pile de matrices rlgl : les DrawCube* sont transformés
-// par la matrice courante (posée par DrawViewModel).
-static void DrawRifleModel(void)
-{
-    const Color METAL = {38, 38, 36, 255};     // acier sombre
-    const Color METAL2 = {55, 54, 50, 255};    // acier plus clair (contraste)
-    const Color POLYMER = {30, 30, 30, 255};   // plastique (poignée, crosse)
-
-    // Boîtier principal et partie basse
-    DrawCube((Vector3){0, 0, 0}, 0.05f, 0.06f, 0.28f, METAL);
-    DrawCube((Vector3){0, -0.048f, 0.02f}, 0.045f, 0.045f, 0.2f, METAL2);
-    // Poignée pistolet (légèrement inclinée : approximée par une boîte)
-    DrawCube((Vector3){0, -0.1f, 0.09f}, 0.036f, 0.1f, 0.05f, POLYMER);
-    // Garde-main + rail supérieur
-    DrawCube((Vector3){0, 0, -0.28f}, 0.055f, 0.055f, 0.3f, METAL2);
-    DrawCube((Vector3){0, 0.034f, -0.12f}, 0.024f, 0.012f, 0.55f, METAL);
-    // Canon et cache-flamme
-    DrawCylinderEx((Vector3){0, 0, -0.43f}, (Vector3){0, 0, -0.58f},
-                   0.012f, 0.012f, 8, METAL);
-    DrawCylinderEx((Vector3){0, 0, -0.56f}, (Vector3){0, 0, -0.62f},
-                   0.016f, 0.016f, 8, (Color){20, 20, 20, 255});
-    // Crosse
-    DrawCube((Vector3){0, -0.01f, 0.28f}, 0.045f, 0.08f, 0.16f, POLYMER);
-    // Viseur : deux montants + point rouge au centre (aligné avec l'axe
-    // de visée : en ADS il tombe exactement au centre de l'écran)
-    DrawCube((Vector3){0, 0.065f, -0.04f}, 0.012f, 0.03f, 0.012f, POLYMER);
-    DrawCube((Vector3){0, 0.065f, 0.02f}, 0.012f, 0.03f, 0.012f, POLYMER);
-    DrawSphere((Vector3){0, 0.085f, -0.04f}, 0.004f, (Color){255, 40, 40, 255});
-
-    // Chargeur courbé (deux boîtes)
-    DrawCube((Vector3){0, -0.1f, -0.03f}, 0.03f, 0.1f, 0.06f, METAL2);
-    DrawCube((Vector3){0, -0.16f, -0.045f}, 0.032f, 0.05f, 0.06f, METAL2);
-
-    // Flash de bouche : boule + étoile de 4 branches, taille aléatoire à
-    // chaque frame pour un effet vivant
-    if (muzzle_t > 0) {
-        float k = 0.8f + Randf(0, 0.6f);
-        DrawSphere((Vector3){0, 0, -0.66f}, 0.03f * k, (Color){255, 240, 170, 255});
-        DrawCube((Vector3){0, 0, -0.66f}, 0.14f * k, 0.012f, 0.012f,
-                 (Color){255, 180, 60, 255});
-        DrawCube((Vector3){0, 0, -0.66f}, 0.012f, 0.14f * k, 0.012f,
-                 (Color){255, 180, 60, 255});
-    }
-
-    // Mains gantées : une sur le garde-main, une sur la poignée
-    const Color GLOVE = {40, 38, 34, 255};
-    DrawSphere((Vector3){-0.005f, -0.045f, -0.3f}, 0.035f, GLOVE);
-    DrawSphere((Vector3){0.0f, -0.1f, 0.1f}, 0.035f, GLOVE);
-}
-
 // Passe de rendu du "view model" : l'arme est dessinée APRÈS la scène,
 // avec une caméra fixe à l'origine et SANS test de profondeur : elle
 // passe toujours devant le décor et ne rentre jamais dans les murs.
+// Le modèle vient de weapons.c (le même que celui que tiennent les autres
+// soldats) ; ici on l'anime : recul, rechargement (l'arme bascule et le
+// chargeur sort), changement d'arme (elle descend puis remonte),
+// réarmement (verrou, pompe, glissière).
 static void DrawViewModel(void)
 {
     if (!my_alive) return;   // pas d'arme à l'écran quand on est mort
+    if (scoped) return;      // dans la lunette : l'arme n'est plus à l'écran
 
     Camera3D vc = {0};
     vc.position = (Vector3){0, 0, 0};
@@ -1060,17 +1173,73 @@ static void DrawViewModel(void)
     vc.fovy = Lerp(55.0f, 45.0f, ads);
     vc.projection = CAMERA_PERSPECTIVE;
 
+    // Animations : rechargement (0 -> 1 -> 0 : elle bascule vers le bas,
+    // le chargeur tombe puis revient), changement (descend hors champ)
+    float rl = (reload_t > 0.0f && reload_total > 0.0f) ? 1.0f - reload_t / (reload_total + 0.05f) : 0.0f;
+    float rl_k = sinf(rl * PI);                 // 0 au début, 1 au milieu, 0 à la fin
+    float sw = (switch_t > 0.0f) ? switch_t / (WEAPON_SWITCH_TIME + 0.05f) : 0.0f;
+    float lower = fmaxf(rl_k * 0.08f, sw * 0.35f);
+    Matrix anim = MatrixMultiply(MatrixRotateXYZ((Vector3){-rl_k * 0.5f - sw * 0.9f, rl_k * 0.25f, -rl_k * 0.3f}),
+                                 MatrixTranslate(rl_k * 0.02f, -lower, rl_k * 0.03f));
+    WeaponPose pose = {0};
+    pose.muzzle = (muzzle_t > 0) ? 0.8f + Randf(0, 0.6f) : 0.0f;
+    pose.mag_out = (rl > 0.15f && rl < 0.85f) ? sinf((rl - 0.15f) / 0.7f * PI) : 0.0f;
+    pose.bolt = sinf(bolt_t * PI);
+
     BeginMode3D(vc);
         rlDisableDepthTest();          // l'arme s'affiche par-dessus tout
-        rlPushMatrix();
-        // On pose le repère de l'arme (rotation + position en espace vue) :
-        // tous les DrawCube de DrawRifleModel se font dedans
-        Matrix m = WeaponViewMatrix();
-        rlMultMatrixf(MatrixToFloat(m));
-        DrawRifleModel();
-        rlPopMatrix();
+        BatchBegin();
+        DrawWeaponModel(MatrixMultiply(anim, WeaponViewMatrix()), my_weapon[my_slot], &pose);
+        BatchEnd();
         rlEnableDepthTest();
     EndMode3D();
+}
+
+// La lunette du FR-F2 : tout l'écran noir sauf un cercle, un réticule fin
+static void DrawScopeOverlay(void)
+{
+    if (!scoped || !my_alive) return;
+    int cx = UIW / 2, cy = UIH / 2;
+    float r = UIH * 0.42f;
+    DrawRing((Vector2){(float)cx, (float)cy}, r, UIH * 1.2f, 0, 360, 64, BLACK);
+    DrawRing((Vector2){(float)cx, (float)cy}, r - 6, r, 0, 360, 64, (Color){30, 30, 30, 255});
+    DrawLine(cx - (int)r, cy, cx + (int)r, cy, Fade(BLACK, 0.9f));
+    DrawLine(cx, cy - (int)r, cx, cy + (int)r, Fade(BLACK, 0.9f));
+    DrawCircle(cx, cy, 2, RED);
+}
+
+// Aperçu 3D d'une arme dans un menu : elle tourne lentement dans un cadre
+// de l'écran. Le cadre a le ratio de l'écran, pour pouvoir simplement
+// restreindre la zone de rendu (rlViewport) sans déformer la projection.
+static void DrawWeaponPreview(void)
+{
+    Rectangle rect;
+    int weapon;
+    if (!MenuWeaponPreview(&rect, &weapon)) return;
+    int sw = GetScreenWidth(), sh = GetScreenHeight();
+    int px = (int)(rect.x * ui_scale), pw = (int)(rect.width * ui_scale);
+    int ph = (int)(rect.height * ui_scale);
+    int py = sh - (int)((rect.y + rect.height) * ui_scale);   // OpenGL : origine en bas
+    if (pw < 8 || ph < 8) return;
+    rlViewport(px, py, pw, ph);
+    Camera3D cam = {0};
+    cam.position = (Vector3){0.0f, 0.35f, 0.9f};
+    cam.target = (Vector3){0, 0, 0};
+    cam.up = (Vector3){0, 1, 0};
+    cam.fovy = 40.0f;
+    cam.projection = CAMERA_PERSPECTIVE;
+    BeginMode3D(cam);
+        rlDisableDepthTest();
+        BatchBegin();
+        // Posée à plat, canon vers la gauche, tournant doucement
+        Matrix m = MatrixMultiply(MatrixRotateY((float)GetTime() * 0.8f), MatrixTranslate(0, 0.02f, 0));
+        Vector3 mz = WeaponMuzzle(weapon);
+        m = MatrixMultiply(MatrixTranslate(0, 0, -mz.z * 0.45f), m);   // centrée sur sa longueur
+        DrawWeaponModel(m, weapon, NULL);
+        BatchEnd();
+        rlEnableDepthTest();
+    EndMode3D();
+    rlViewport(0, 0, sw, sh);
 }
 
 // Pseudos au-dessus des têtes (projection 3D -> écran)
@@ -1104,6 +1273,7 @@ static void DrawNameTags(Camera3D cam)
 static void DrawCrosshair(void)
 {
     if (ads > 0.7f) return;        // en visée : le viseur de l'arme suffit
+    if (!my_alive) return;
     Color c = (hit_marker_timer > 0) ? RED : RAYWHITE;
     c = Fade(c, 1.0f - ads);       // s'efface pendant la transition de visée
     int cx = UIW / 2, cy = UIH / 2;
@@ -1157,6 +1327,40 @@ static void DrawHUD(void)
         snprintf(buf, sizeof(buf), "K %d / D %d", me->kills, me->deaths);
         DrawText(buf, 30, UIH - 82, 18, RAYWHITE);
     }
+
+    // --- L'arme et ses munitions, en bas au centre ---
+    if (me && me->active && me->alive) {
+        const WeaponStats *w = CurWeapon();
+        int cx = UIW / 2 + 120;
+        DrawText(w->name, cx - MeasureText(w->name, 18) / 2, UIH - 88, 18, LIGHTGRAY);
+        if (w->mag > 0) {
+            snprintf(buf, sizeof(buf), "%d", my_mag[my_slot]);
+            Color c = (my_mag[my_slot] == 0) ? RED : (my_mag[my_slot] <= w->mag / 4 ? ORANGE : RAYWHITE);
+            int wmag = MeasureText(buf, 40);
+            DrawText(buf, cx - 8 - wmag, UIH - 62, 40, c);
+            DrawText("|", cx - 2, UIH - 60, 36, GRAY);
+            snprintf(buf, sizeof(buf), "%d", my_reserve[my_slot]);
+            DrawText(buf, cx + 14, UIH - 52, 24, LIGHTGRAY);
+        }
+        if (reload_t > 0.0f) {
+            // Barre de rechargement
+            float k = 1.0f - reload_t / (reload_total + 0.05f);
+            DrawRectangle(cx - 70, UIH - 20, 140, 6, Fade(BLACK, 0.5f));
+            DrawRectangle(cx - 70, UIH - 20, (int)(140 * k), 6, (Color){255, 200, 90, 255});
+            DrawText("rechargement", cx - MeasureText("rechargement", 14) / 2, UIH - 36, 14, LIGHTGRAY);
+        } else if (w->mag > 0 && my_mag[my_slot] == 0) {
+            const char *m = my_reserve[my_slot] > 0 ? "R : recharger" : "plus de munitions";
+            DrawText(m, cx - MeasureText(m, 14) / 2, UIH - 36, 14, RED);
+        }
+        // L'autre arme, en petit
+        int other = (my_slot == SLOT_PRIMARY) ? SLOT_SECONDARY : SLOT_PRIMARY;
+        snprintf(buf, sizeof(buf), "%d  %s  %d|%d", other + 1, WEAPONS[my_weapon[other]].name,
+                 my_mag[other], my_reserve[other]);
+        DrawText(buf, cx + 120, UIH - 52, 14, GRAY);
+    }
+    if (weapon_msg_t > 0.0f)
+        DrawText(weapon_msg, UIW / 2 - MeasureText(weapon_msg, 20) / 2, 90, 20,
+                 Fade((Color){255, 200, 90, 255}, weapon_msg_t > 1.0f ? 1.0f : weapon_msg_t));
 
     DrawCrosshair();
 
@@ -1231,171 +1435,128 @@ static void DrawHUD(void)
     }
 
     // --- Alerte si le serveur ne répond plus depuis 2 s ---
-    if (GetTime() - last_server_msg > 2.0) {
+    if (last_server_msg >= 0.0 && GetTime() - last_server_msg > 2.0) {
         const char *msg = "Connexion au serveur perdue...";
         DrawText(msg, UIW / 2 - MeasureText(msg, 20) / 2, 60, 20, ORANGE);
     }
 }
 
 //----------------------------------------------------------------------------------
-// Boucle principale
+// Menus
 //----------------------------------------------------------------------------------
-#if MOBILE_UI
-//----------------------------------------------------------------------------------
-// Écran de connexion du mobile
-//----------------------------------------------------------------------------------
-// Un téléphone n'a pas de ligne de commande : impossible de passer l'adresse
-// du serveur en argument. On ouvre donc la fenêtre d'abord et on demande
-// l'adresse au doigt, sur un pavé numérique (chiffres, point, effacement).
-//
-// raylib fait passer le tactile pour la souris sur Android : le même code
-// marche sur PC, ce qui permet de régler cet écran sans téléphone.
-//
-// Remplit ip (cap octets) et renvoie true quand la connexion est établie,
-// false si le joueur quitte l'application.
-static bool MobileConnectScreen(char *ip, int cap, const char *name)
+// Applique ce que les options changent hors du jeu lui-même
+static void ApplyOptions(void)
 {
-    // Pavé 3 x 4. Le « : » sert à viser un port autre que celui par défaut
-    // (« 192.168.1.20:27015 ») ; l'effacement a son propre bouton, à droite
-    // du champ de saisie.
-    static const char *keys[12] = { "1","2","3","4","5","6","7","8","9",".","0",":" };
+    TouchSetSensitivity(options.touch_sens);
+#if !MOBILE_UI
+    if (options.fullscreen != IsWindowFullscreen()) ToggleFullscreen();
+#endif
+}
+
+// Une image d'un écran de menu, de la lecture du pointeur au dessin :
+// le fond est fourni par l'appelant (déjà dessiné), on ajoute l'écran
+// courant par-dessus, en unités d'interface, puis l'aperçu 3D s'il y en a.
+static MenuAction MenuDrawFrame(MenuScreen *screen, bool in_game, const char *status)
+{
+    UiBegin(ui_scale);
+    MenuSetScreen(ui_w, ui_h, MOBILE_UI);
+    BeginMode2D(UiCamera());
+    MenuAction a = MenuFrame(screen, in_game, status);
+    EndMode2D();
+    DrawWeaponPreview();
+    return a;
+}
+
+// Écran d'accueil : serveur, pseudo, armes, options. Boucle jusqu'à la
+// connexion (vrai) ou l'abandon (faux). Sur mobile, c'est le seul moyen
+// d'entrer l'adresse ; sur PC, il remplace la ligne de commande.
+static bool MainMenuLoop(void)
+{
     const Color BG = {18, 20, 26, 255};
-    char msg[80] = "";
-    bool    held = false;      // un contact est en cours
-    Vector2 held_pos = {0};    // sa derniere position (pixels reels)
+    MenuScreen screen = MENU_MAIN;
+    char status[96] = "";
+#if defined(PLATFORM_ANDROID)
+    double last_log = 0.0;
+#endif
 
-    for (;;) {
-        if (WindowShouldClose()) return false;
+    while (!WindowShouldClose()) {
         UiUpdate();
-
-        // Disposition, en unités d'interface : pavé 3 x 4 centré
-        float bw = 112, bh = 78, gap = 12;
-        float gx = ui_w / 2 - (3 * bw + 2 * gap) / 2, gy = 236;
-        Rectangle connect = { ui_w / 2 - 140, gy + 4 * (bh + gap) + 14, 280, 78 };
-        Rectangle field = { ui_w / 2 - 200, 150, 400, 62 };
-        Rectangle erase = { field.x + field.width + 12, field.y, 76, field.height };
-
-        // --- Un appui = un contact pose PUIS leve sur un bouton ---------
-        // On agit au RELACHEMENT, pas a la pose. IsMouseButtonPressed exige
-        // que la pose et la levee tombent dans deux images differentes, ce
-        // qu'un appui tres bref ne garantit pas ; et sur Android on ne
-        // presume pas de la facon dont raylib emule la souris a partir du
-        // tactile. Ici on lit les DEUX sources : tant qu'un contact existe,
-        // on retient sa position ; quand il disparait, on declenche. C'est
-        // aussi le comportement attendu d'un bouton.
-        int  touches = GetTouchPointCount();
-        bool down = IsMouseButtonDown(MOUSE_BUTTON_LEFT) || touches > 0;
+#if defined(PLATFORM_ANDROID)
         // Témoin pour logcat, une fois par seconde : l'état BRUT des entrées
-        // tel que raylib le rapporte. Si aucun contact n'apparaît jamais ici
-        // alors que l'écran est touché, les événements n'atteignent pas le
-        // jeu — ce n'est pas la logique du pavé qui est en cause.
-        {
-            static double last_log = 0.0;
-            double now = GetTime();
-            if (now - last_log >= 1.0) {
-                last_log = now;
-                // ecran : la taille que LE JEU voit (c'est d'elle que depend
-                // la geometrie du pave) — le test en CI s'y cale.
-                TraceLog(LOG_INFO, "TACTILE: etat touches=%d souris=%d ecran=%dx%d t=%.0f",
-                         touches, IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1 : 0,
-                         GetScreenWidth(), GetScreenHeight(), now);
-            }
+        // et la taille que LE JEU voit (le test en CI s'y cale).
+        if (GetTime() - last_log >= 1.0) {
+            last_log = GetTime();
+            TraceLog(LOG_INFO, "TACTILE: etat touches=%d souris=%d ecran=%dx%d t=%.0f",
+                     GetTouchPointCount(), IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1 : 0,
+                     GetScreenWidth(), GetScreenHeight(), GetTime());
         }
-        if (down) {
-            held = true;
-            held_pos = (touches > 0) ? GetTouchPosition(0) : GetMousePosition();
-        }
-        bool tapped = held && !down;      // le contact vient de se lever
-        if (tapped) {
-            held = false;
-            Vector2 m = held_pos;
-            m.x /= ui_scale;      // les contacts arrivent en pixels réels
-            m.y /= ui_scale;
-            // Sur mobile, logcat est le seul temoin : une ligne par appui
-            // (silencieuse sur PC, ou le niveau de log est WARNING).
-            TraceLog(LOG_INFO, "TACTILE: appui relache en (%.0f, %.0f) px -> (%.0f, %.0f) unites",
-                     held_pos.x, held_pos.y, m.x, m.y);
-            for (int i = 0; i < 12; i++) {
-                Rectangle r = { gx + (i % 3) * (bw + gap), gy + (i / 3) * (bh + gap), bw, bh };
-                if (!CheckCollisionPointRec(m, r)) continue;
-                size_t len = strlen(ip);
-                if (len + 1 < (size_t)cap) { ip[len] = keys[i][0]; ip[len + 1] = '\0'; }
-                TraceLog(LOG_INFO, "TACTILE: touche '%s' -> adresse \"%s\"", keys[i], ip);
-            }
-            if (CheckCollisionPointRec(m, erase)) {
-                size_t len = strlen(ip);
-                if (len > 0) ip[len - 1] = '\0';
-            }
-            if (CheckCollisionPointRec(m, connect) && ip[0] != '\0') {
-                // NetConnect bloque jusqu'à 5 s (10 tentatives) : on affiche
-                // d'abord une image, sinon l'écran semble figé.
-                BeginDrawing();
-                ClearBackground(BG);
-                BeginMode2D(UiCamera());
-                const char *t = "Connexion...";
-                DrawText(t, (int)(ui_w / 2) - MeasureText(t, 36) / 2, 320, 36, RAYWHITE);
-                EndMode2D();
-                EndDrawing();
-
-                if (NetConnect(ip, name)) return true;
-                snprintf(msg, sizeof(msg), "Serveur injoignable : %s", ip);
-            }
-        }
-
-        // --- Dessin ---
+#endif
         BeginDrawing();
         ClearBackground(BG);
-        BeginMode2D(UiCamera());
-
-        const char *title = "EMA TOURNAMENT";
-        DrawText(title, (int)(ui_w / 2) - MeasureText(title, 44) / 2, 52, 44, RAYWHITE);
-        const char *sub2 = "Adresse du serveur (port 7777 par defaut)";
-        DrawText(sub2, (int)(ui_w / 2) - MeasureText(sub2, 20) / 2, 112, 20, GRAY);
-
-        // Champ de saisie, et son bouton d'effacement
-        DrawRectangleRec(field, Fade(BLACK, 0.5f));
-        DrawRectangleLinesEx(field, 2, Fade(RAYWHITE, 0.4f));
-        const char *shown = (ip[0] != '\0') ? ip : "___.___.___.___";
-        DrawText(shown, (int)(field.x + field.width / 2) - MeasureText(shown, 34) / 2,
-                 (int)field.y + 14, 34, ip[0] ? RAYWHITE : DARKGRAY);
-        DrawRectangleRec(erase, Fade(RAYWHITE, 0.14f));
-        DrawRectangleLinesEx(erase, 1, Fade(RAYWHITE, 0.3f));
-        DrawText("<", (int)(erase.x + erase.width / 2) - MeasureText("<", 32) / 2,
-                 (int)(erase.y + erase.height / 2) - 16, 32, RAYWHITE);
-
-        // Pavé
-        for (int i = 0; i < 12; i++) {
-            Rectangle r = { gx + (i % 3) * (bw + gap), gy + (i / 3) * (bh + gap), bw, bh };
-            DrawRectangleRec(r, Fade(RAYWHITE, 0.12f));
-            DrawRectangleLinesEx(r, 1, Fade(RAYWHITE, 0.3f));
-            DrawText(keys[i], (int)(r.x + r.width / 2) - MeasureText(keys[i], 32) / 2,
-                     (int)(r.y + r.height / 2) - 16, 32, RAYWHITE);
-        }
-
-        // Bouton CONNECTER
-        bool ready = (ip[0] != '\0');
-        DrawRectangleRec(connect, Fade(ready ? (Color){70, 160, 90, 255} : GRAY, 0.8f));
-        DrawRectangleLinesEx(connect, 2, Fade(RAYWHITE, 0.5f));
-        const char *cl = "CONNECTER";
-        DrawText(cl, (int)(connect.x + connect.width / 2) - MeasureText(cl, 30) / 2,
-                 (int)(connect.y + 24), 30, RAYWHITE);
-
-        if (msg[0] != '\0')
-            DrawText(msg, (int)(ui_w / 2) - MeasureText(msg, 20) / 2,
-                     (int)(connect.y + connect.height + 16), 20, (Color){235, 90, 70, 255});
-
-        EndMode2D();
+        MenuAction a = MenuDrawFrame(&screen, false, status);
+        if (options.show_fps) DrawFPS(GetScreenWidth() - 90, GetScreenHeight() - 30);
         EndDrawing();
+#if defined(PLATFORM_ANDROID)
+        if (UiReleased()) {
+            Vector2 u = UiPointer();
+            TraceLog(LOG_INFO, "TACTILE: appui relache en (%.0f, %.0f) px -> (%.0f, %.0f) unites",
+                     u.x * ui_scale, u.y * ui_scale, u.x, u.y);
+        }
+#endif
+        switch (a) {
+        case MA_QUIT:
+            return false;
+        case MA_OPTIONS_CHANGED:
+        case MA_LOADOUT:
+            OptionsSave();
+            ApplyOptions();
+            if (a == MA_LOADOUT) screen = MENU_MAIN;
+            break;
+        case MA_PLAY: {
+            const char *ip = options.server[0] ? options.server : "127.0.0.1";
+            const char *name = options.name[0] ? options.name : "Joueur";
+            // NetConnect bloque jusqu'à 5 s (10 tentatives) : on affiche
+            // d'abord une image, sinon l'écran semble figé.
+            BeginDrawing();
+            ClearBackground(BG);
+            BeginMode2D(UiCamera());
+            UiTextCentered(TextFormat("Connexion à %s...", ip), ui_w / 2, 320, 36, RAYWHITE);
+            EndMode2D();
+            EndDrawing();
+            if (NetConnect(ip, name)) { OptionsSave(); return true; }
+            snprintf(status, sizeof(status), "Serveur injoignable : %s", ip);
+            break;
+        }
+        default:
+            break;
+        }
     }
+    return false;
 }
-#endif  // MOBILE_UI
 
+// Ouvre ou ferme un menu en jeu. Sur PC la souris est rendue au menu et
+// reprise par la visée ; sur mobile les doigts posés sont oubliés pour
+// que le joystick ne reste pas « tenu ».
+static void SetMenu(MenuScreen m)
+{
+    if (m == menu) return;
+    menu = m;
+#if !MOBILE_UI
+    if (menu == MENU_NONE) DisableCursor(); else EnableCursor();
+#endif
+    TouchReset();
+}
+
+//----------------------------------------------------------------------------------
+// Boucle principale
+//----------------------------------------------------------------------------------
 int main(int argc, char **argv)
 {
-#if !MOBILE_UI
-    const char *ip = (argc > 1) ? argv[1] : "127.0.0.1";   // serveur à joindre
-#endif
-    const char *name = (argc > 2) ? argv[2] : "Joueur";
+    OptionsLoad();
+    // Ligne de commande (PC) : ./client [ip[:port]] [pseudo] saute l'accueil
+    const char *ip_arg = (argc > 1) ? argv[1] : NULL;
+    if (argc > 2) snprintf(options.name, sizeof(options.name), "%s", argv[2]);
+    const char *name = options.name[0] ? options.name : "Joueur";
 
 #if !MOBILE_UI
     // raylib moins bavard dans la console. PAS sur mobile : logcat y est le
@@ -1405,35 +1566,40 @@ int main(int argc, char **argv)
     SetTraceLogLevel(LOG_WARNING);
 #endif
 
-#if MOBILE_UI
-    // Mobile : la fenêtre d'abord (il faut un écran pour demander l'adresse
-    // du serveur), et pas de capture du curseur — on a besoin du doigt.
-  #if defined(PLATFORM_ANDROID)
+    bool connected = false;
+    if (ip_arg) {
+        // PC : on se connecte AVANT d'ouvrir la fenêtre, inutile de l'ouvrir
+        // si le serveur est injoignable
+        printf("EMA Tournament — connexion à %s en tant que \"%s\"\n", ip_arg, name);
+        if (!NetConnect(ip_arg, name)) return 1;
+        snprintf(options.server, sizeof(options.server), "%s", ip_arg);
+        connected = true;
+    }
+
+#if defined(PLATFORM_ANDROID)
     // 0 x 0 : raylib prend la taille NATIVE de l'écran. Avec 1280 x 720 il
     // rendrait en 16:9 et agrandirait l'image avec des bandes noires sur les
     // côtés (vu dans l'émulateur : « Upscaling required »). En natif, c'est
     // UiUpdate qui adapte le HUD au ratio réel de l'écran.
     InitWindow(0, 0, "EMA Tournament");
-  #else
-    InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament");   // tactile simulé sur PC
-  #endif
     SetTargetFPS(60);                // 60 Hz : suffisant, et ménage la batterie
+#else
+    InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament");
+    SetTargetFPS(144);
+    SetExitKey(KEY_NULL);            // Échap ouvre le menu, il ne quitte plus
+#endif
     UiUpdate();
-    char ip_typed[64] = "";
-    if (!MobileConnectScreen(ip_typed, (int)sizeof(ip_typed), name)) {
+    ApplyOptions();
+
+    if (!connected && !MainMenuLoop()) {
         CloseWindow();
         return 0;
     }
-#else
-    printf("FPS TDM — connexion à %s en tant que \"%s\"\n", ip, name);
-    // PC : on se connecte AVANT d'ouvrir la fenêtre, inutile de l'ouvrir si
-    // le serveur est injoignable
-    if (!NetConnect(ip, name)) return 1;
-
-    InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament — TDM");
-    SetTargetFPS(144);
+#if !MOBILE_UI
     DisableCursor();   // capture la souris (visée FPS)
 #endif
+    // L'équipement choisi : le serveur l'applique au spawn
+    SendLoadout();
 
     ModelsInit();   // crée les maillages des personnages (après InitWindow)
     // Un état d'animation par joueur, décalé par son numéro de slot : deux
@@ -1449,27 +1615,42 @@ int main(int argc, char **argv)
     my_sim.on_ground = true;
     my_yaw = (my_team == TEAM_RED) ? 0.0f : (float)M_PI;   // face au centre
     memset(&snap, 0, sizeof(snap));
+    my_weapon[SLOT_PRIMARY] = options.primary;
+    my_weapon[SLOT_SECONDARY] = options.secondary;
+    last_server_msg = GetTime();
 
     double last_state_send = 0.0;
     float fov_current = FOV_HIP;
     Camera3D cam = {0};
+    char menu_status[96] = "";
 
-    while (!WindowShouldClose()) {
+    while (!WindowShouldClose() && !quit_requested) {
         // dt plafonné : après un gel (fenêtre déplacée...), pas de pas de
         // physique géant qui ferait traverser les murs
         float dt = GetFrameTime();
         if (dt > 0.05f) dt = 0.05f;
 
         UiUpdate();                         // l'écran a pu tourner (mobile)
-        TouchUpdate(ui_scale, ui_w, ui_h);  // doigts posés cette image
         NetReceive();                       // snapshots + événements
 
-        if (my_alive && !snap.match_over) UpdateLocalPlayer(dt);
+        // --- Menus : Échap (PC) ou le bouton MENU (mobile) ; B : armes ---
+        PlayerInput menu_in = {0};
+        if (menu == MENU_NONE) {
+            TouchUpdate(ui_scale, ui_w, ui_h);  // doigts posés cette image
+            TouchApply(&menu_in, ads);          // seul in.menu nous intéresse ici
+        }
+#if !MOBILE_UI
+        if (IsKeyPressed(KEY_ESCAPE)) SetMenu(menu == MENU_NONE ? MENU_PAUSE : MENU_NONE);
+        if (IsKeyPressed(KEY_B) && menu == MENU_NONE) SetMenu(MENU_WEAPONS);
+#endif
+        if (menu_in.menu) SetMenu(MENU_PAUSE);
+
+        if (menu == MENU_NONE && my_alive && !snap.match_over) UpdateLocalPlayer(dt);
         UpdateViewEffects(dt);              // recul, bloom, minuteurs...
         InterpolateOthers(dt);              // lissage des autres joueurs
         UpdatePlayerCamera(&cam, dt, &fov_current);
 
-        // Envoi périodique de notre position au serveur
+        // Envoi périodique de nos entrées au serveur (vide = battement de cœur)
         if (GetTime() - last_state_send > 1.0 / CLIENT_SEND_HZ) {
             last_state_send = GetTime();
             NetSendInputs();
@@ -1490,12 +1671,42 @@ int main(int argc, char **argv)
         // 3) l'interface, en unités d'interface : la caméra 2D la met à
         // l'échelle de l'écran réel (indispensable sur mobile).
         BeginMode2D(UiCamera());
+        DrawScopeOverlay();
         DrawNameTags(cam);
         DrawHUD();
-        TouchDraw();            // joystick et boutons (mobile seulement)
-        DrawFPS(UIW - 90, UIH - 30);
+        if (menu == MENU_NONE) TouchDraw();   // joystick et boutons (mobile seulement)
+        if (options.show_fps) DrawFPS(UIW - 90, UIH - 30);
         EndMode2D();
+
+        // 4) le menu, s'il est ouvert, par-dessus tout
+        if (menu != MENU_NONE) {
+            MenuScreen before = menu;
+            MenuAction a = MenuDrawFrame(&menu, true, menu_status);
+            if (menu != before) SetMenu(menu);
+            switch (a) {
+            case MA_RESUME:  SetMenu(MENU_NONE); break;
+            case MA_QUIT:    quit_requested = true; break;
+            case MA_LOADOUT:
+                OptionsSave();
+                SendLoadout();
+                SetMenu(MENU_NONE);
+                break;
+            case MA_OPTIONS_CHANGED:
+                OptionsSave();
+                ApplyOptions();
+                break;
+            default: break;
+            }
+        }
         EndDrawing();
+        {
+            // Le bouton d'arme du mobile affiche les munitions de l'arme en main
+            char lbl[24];
+            const WeaponStats *w = CurWeapon();
+            if (w->mag > 0) snprintf(lbl, sizeof(lbl), "%d|%d", my_mag[my_slot], my_reserve[my_slot]);
+            else snprintf(lbl, sizeof(lbl), "ARME");
+            TouchSetAmmoLabel(lbl);
+        }
     }
 
     NetSendDisconnect();
