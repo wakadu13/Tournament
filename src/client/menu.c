@@ -196,9 +196,12 @@ static MenuAction WeaponsScreen(MenuScreen *screen, bool in_game, const char *st
     DrawText(line, (int)x2, (int)(by + 130), 14, LIGHTGRAY);
     // L'aperçu 3D occupe le reste de la fiche (dessiné par l'appelant)
     preview_on = true;
-    float ph = fw * vh / vw;
-    if (ph > panel.y + panel.height - (by + 156) - 90) ph = panel.y + panel.height - (by + 156) - 90;
-    preview_rect = (Rectangle){ x2, by + 152, fw, ph };
+    // Même ratio que l'écran (voir DrawWeaponPreview) : si la hauteur
+    // manque, la largeur se réduit d'autant.
+    float pw2 = fw, ph = fw * vh / vw;
+    float avail = panel.y + panel.height - (by + 156) - 90;
+    if (ph > avail) { ph = avail; pw2 = ph * vw / vh; }
+    preview_rect = (Rectangle){ x2, by + 152, pw2, ph };
     preview_weapon = highlight;
 
     MenuAction a = MA_NONE;
