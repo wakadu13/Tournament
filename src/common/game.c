@@ -261,6 +261,7 @@ void MapInit(void)
     Crate(-56, -32.5f, 1.5f, 1.5f);
     Crate(-49, -38, 2.0f, 2.0f);
     Sandbags(-44, -48, -41, -47);
+    Crate(-37.5f, -50, 2.0f, 2.0f);
     Rug(-45, -45, -40, -41);
 
     // ===== Spawn CT (nord, centre) : une arcade le long de l'enceinte =====
@@ -269,6 +270,8 @@ void MapInit(void)
     CrateStack(14.5f, -45.5f, 3.0f, 1.2f);
     Sandbags(4, -44.5f, 8, -43.5f);
     Sandbags(-8, -44.5f, -4, -43.5f);
+    Wall(22, -48, 23, -44, 1.2f);                   // muret sur le passage CT -> A
+    Barrels(31, -55.5f);
     Barrels(17, -55.5f);
     Rug(-4, -53, 4, -48);
 
@@ -298,7 +301,10 @@ void MapInit(void)
 
     // ===== Bloc est (entre mid et long A) =====
     Wall(10, -18, 34, 32, H_WALL);
-    Wall(34, -18, 46, 36, 5.0f);
+    Wall(34, -18, 46, 0, 5.0f);                     // avec une alcôve sur long (z 0..6)
+    Wall(34, 0, 42, 6, 5.0f);
+    Wall(34, 6, 46, 36, 5.0f);
+    Crate(44, 3, 1.5f, 1.5f);
     Crate(21, 34, 2.0f, 2.0f);                      // outside long
     Barrels(14, 36);
 
@@ -321,6 +327,9 @@ void MapInit(void)
     StairsX(36, 1, -56, -48, 4, 0.4f, 1.0f);        // ses marches, côté ouest
     StairsZ(-44, -1, 44, 50, 4, 0.4f, 1.0f);        // et côté sud
     CrateStack(40, -36, 2.0f, 2.0f);
+    Solid(50, 0, -34, 54.5f, 2.2f, -32, K_METAL);   // un fourgon abandonné
+    Solid(54.5f, 0, -34, 56, 1.6f, -32, K_METAL);   // sa cabine
+    Decor(50.2f, 0.9f, -34.05f, 54.3f, 1.9f, -31.95f, K_CLOTH);   // sa bâche
     Crate(56, -27, 2.0f, 1.5f);
     Barrels(56.5f, -31.5f);
     Sandbags(42, -42, 45, -41);
@@ -345,7 +354,20 @@ void MapInit(void)
     Barrels(-30, 55);
     Crate(23, 42, 2.0f, 1.2f);
     Sandbags(-10, 42, -6, 43);
-    Crate(-29, 43, 2.0f, 2.0f);
+    // Des étals de marché : quatre poteaux, une toile, un comptoir
+    for (int k = 0; k < 2; k++) {
+        Column(-36 + k * 9.5f, 42, 0.15f, 2.6f);
+        Column(-36 + k * 9.5f, 46, 0.15f, 2.6f);
+    }
+    Awning(-36.5f, 41.5f, -26, 46.5f, 2.5f);
+    Solid(-35, 0, 43, -27.5f, 1.0f, 44, K_WOOD);
+    Crate(-33, 45.2f, 1.2f, 0.8f);
+    Crate(-29, 45.2f, 1.2f, 1.0f);
+    // La remise, contre l'enceinte ouest : porte à l'est
+    Wall(-58, 50, -52.5f, 50.5f, 3.5f);
+    DoorWallZ(50, 58, -52.5f, -52, 3.5f, 53, 55, 2.3f);
+    Solid(-58, 3.5f, 50, -52, 3.8f, 58, K_ROOF);
+    Barrels(-56, 56);
     Barrels(-50, 46);
     Rug(-5, 48, 5, 54);
 }

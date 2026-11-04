@@ -31,7 +31,7 @@ Inspirée de Dust 2, à l'échelle d'une vraie carte de Counter-Strike :
 [src/common/game.c](src/common/game.c)) par des fonctions qui posent des
 murs percés de **portes** et de **fenêtres**, des **escaliers**, des
 caisses, des tonneaux, des sacs de sable, des colonnes et des arcades :
-environ 170 volumes qui bloquent joueurs et balles, et 200 éléments de
+environ 200 volumes qui bloquent joueurs et balles, et 200 éléments de
 décor (battants de portes, encadrements, auvents, tapis, poutres,
 créneaux) que seul le client dessine. Les T (bleus) partent au sud, les
 CT (rouges) au nord, et trois voies relient les deux camps vers les deux
