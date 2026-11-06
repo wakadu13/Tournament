@@ -78,6 +78,7 @@ static uint8_t spawn_count = 0;    // compteur de respawn (voir protocol.h)
 static float attack_cd = 0.0f;     // temps avant la prochaine griffe
 static int   kind = BOT_ZOMBIE;    // BotKind
 static int   skill = 2;            // 0 = maladroit .. 3 = redoutable (soldat)
+static bool  debug = false;        // EMA_BOT_DEBUG=1 : journal du cerveau du soldat
 static float pitch = 0.0f;         // le soldat lève ou baisse son arme
 static bool  use_held = false;     // action maintenue (bombe)
 static uint16_t shot_seq = 0;
@@ -284,6 +285,51 @@ static bool CanSee(V3 a, V3 b)
     return RaycastMap(o, d) >= len - 0.05f;
 }
 
+// Peut-on MARCHER droit de a à b ? Voir ne suffit pas : une caisse d'un
+// mètre ou des sacs de sable se voient par-dessus mais ne se passent pas,
+// et une passerelle se quitte par ses escaliers. On fait donc MARCHER un
+// joueur simulé (PlayerStep, la même physique que le serveur) tout droit
+// vers b, et on regarde s'il arrive. Une dizaine de millisecondes de calcul
+// au plus : à n'appeler que quand on recalcule un chemin, pas à chaque tick.
+static bool CanWalk(V3 a, V3 b)
+{
+    float dx = b.x - a.x, dz = b.z - a.z, len = sqrtf(dx * dx + dz * dz);
+    if (len < 0.5f) return true;
+    PlayerSim s;
+    memset(&s, 0, sizeof(s));
+    s.pos = a;
+    s.on_ground = true;
+    int ticks = (int)((len / PLAYER_SPEED + 1.0f) * 60);
+    if (ticks > 900) ticks = 900;
+    for (int i = 0; i < ticks; i++) {
+        PlayerCmd c = {0};
+        c.move_y = 1.0f;
+        c.speed_mult = 1.0f;
+        c.yaw = atan2f(b.x - s.pos.x, b.z - s.pos.z);
+        PlayerStep(&s, &c, 1.0f / 60.0f);
+        float ex = b.x - s.pos.x, ez = b.z - s.pos.z;
+        if (ex * ex + ez * ez < 1.5f * 1.5f) return true;
+    }
+    return false;
+}
+
+// Vers `goal` tout droit, si on peut y marcher : vérifié toutes les
+// 0,7 s seulement (CanWalk simule une marche entière)
+static bool DirectWalk(V3 goal, float dt)
+{
+    static float age = 99.0f;
+    static bool  ok = false;
+    static V3    last_goal;
+    age += dt;
+    float gx = goal.x - last_goal.x, gz = goal.z - last_goal.z;
+    if (age > 0.7f || gx * gx + gz * gz > 4.0f) {
+        age = 0.0f;
+        last_goal = goal;
+        ok = CanWalk(pos, goal);
+    }
+    return ok;
+}
+
 // Nœud le plus proche de p, visible depuis p si possible
 static int NearestNode(V3 p)
 {
@@ -320,6 +366,8 @@ static void FindPath(int from, int to)
     path_i = 0;
 }
 
+static V3 Steer(V3 goal, bool direct, float dt);   // défini avec le soldat, partagé
+
 // Un pas de simulation du zombie (appelé ZOMBIE_TICK_HZ fois par seconde)
 static void ZombieThink(float dt)
 {
@@ -337,26 +385,8 @@ static void ZombieThink(float dt)
     // --- Où aller : droit sur la proie si on la voit, sinon vers le
     // prochain point de passage du chemin qui y mène. ---
     V3 tpos = {target->x, target->y, target->z};
-    V3 goal = tpos;
     bool sees = CanSee(pos, tpos);
-    path_age += dt;
-    if (!sees) {
-        if (path_age > 1.0f || path_len == 0) {
-            path_age = 0.0f;
-            FindPath(NearestNode(pos), NearestNode(tpos));
-        }
-        // On avance d'un nœud dès qu'on est dessus (ou qu'on voit le suivant)
-        while (path_i < path_len) {
-            V3 n = NAV_NODES[path[path_i]].pos;
-            float dx = n.x - pos.x, dz = n.z - pos.z;
-            if (dx * dx + dz * dz < 2.5f * 2.5f) { path_i++; continue; }
-            if (path_i + 1 < path_len && CanSee(pos, NAV_NODES[path[path_i + 1]].pos)) { path_i++; continue; }
-            break;
-        }
-        if (path_i < path_len) goal = NAV_NODES[path[path_i]].pos;
-    } else {
-        path_len = 0;
-    }
+    V3 goal = Steer(tpos, sees, dt);   // droit sur elle s'il la voit, sinon de nœud en nœud
 
     // Il regarde sa proie s'il la voit, sinon là où il va : le déplacement
     // est relatif à yaw, donc « en avant » = vers son but
@@ -446,12 +476,16 @@ static V3 Steer(V3 goal, bool direct, float dt)
     if (path_age > 1.0f || path_len == 0) {
         path_age = 0.0f;
         FindPath(NearestNode(pos), NearestNode(goal));
+        // Le nœud le plus proche est parfois DERRIÈRE nous : on saute tous
+        // ceux dont on peut déjà rejoindre le suivant en marchant droit
+        while (path_i + 1 < path_len && CanWalk(pos, NAV_NODES[path[path_i + 1]].pos)) path_i++;
+        // Et si le but lui-même est à portée de marche, plus besoin de nœuds
+        if (path_len > 0 && CanWalk(pos, goal)) path_len = 0;
     }
     while (path_i < path_len) {
         V3 n = NAV_NODES[path[path_i]].pos;
         float dx = n.x - pos.x, dz = n.z - pos.z;
         if (dx * dx + dz * dz < 2.5f * 2.5f) { path_i++; continue; }
-        if (path_i + 1 < path_len && CanSee(pos, NAV_NODES[path[path_i + 1]].pos)) { path_i++; continue; }
         break;
     }
     if (path_i < path_len) return NAV_NODES[path[path_i]].pos;
@@ -539,7 +573,7 @@ static void SoldierThink(float dt)
             use_held = defuser;
         } else {
             goal = bomb;
-            direct = CanSee(pos, bomb);
+            direct = DirectWalk(bomb, dt);
         }
     } else if (fighting) {
         // Garder la distance de son arme : avancer, reculer, ou se décaler
@@ -595,6 +629,20 @@ static void SoldierThink(float dt)
     }
     StuckCheck(mx, my, PLAYER_SPEED * k);
     PushInput(dt, mx, my, jump_hold > 0.0f);
+
+    // Journal de débogage (EMA_BOT_DEBUG=1) : une ligne par seconde
+    if (debug) {
+        static float dbg_t = 0.0f;
+        dbg_t += dt;
+        if (dbg_t >= 1.0f) {
+            dbg_t = 0.0f;
+            V3 st = (path_i < path_len) ? NAV_NODES[path[path_i]].pos : goal;
+            printf("[dbg] pos (%.1f,%.2f,%.1f) bombe etat %d a (%.0f,%.0f) porteur %d | carrier %d defuser %d fetch %d fighting %d stand %d use %d | but (%.0f,%.0f) vers (%.0f,%.0f) direct %d chemin %d/%d | cible %s dist %.0f sees %d | mx %.1f my %.1f saut %d\n",
+                   pos.x, pos.y, pos.z, snap.bomb_state, snap.bomb_x, snap.bomb_z, snap.bomb_carrier,
+                   carrier, defuser, fetch, fighting, stand, use_held, goal.x, goal.z, st.x, st.z, direct, path_i, path_len,
+                   target ? target->name : "-", dist, sees, mx, my, jump_hold > 0.0f);
+        }
+    }
 
     // --- Munitions : recharger à vide, passer au pistolet sans réserve ---
     if (w->mag > 0 && me->mag[slot] == 0 && reload_wait <= 0.0f && switch_wait <= 0.0f) {
@@ -652,6 +700,7 @@ int main(int argc, char **argv)
     if (argc > 4) { skill = atoi(argv[4]); if (skill < 0) skill = 0; if (skill > 3) skill = 3; }
     srand((unsigned)(time(NULL) ^ getpid()));
     setvbuf(stdout, NULL, _IOLBF, 0);   // logs visibles même redirigés
+    debug = getenv("EMA_BOT_DEBUG") != NULL;
     MapInit();
 
     if (!NetConnect(ip, name)) return 1;
