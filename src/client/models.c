@@ -19,6 +19,8 @@
 #include "raymath.h"
 
 #include "models.h"
+#include "../common/protocol.h"
+#include "weapons.h"
 
 // Raccourci pour un Vector3 littéral. ATTENTION : on ne peut pas l'appeler
 // V3 comme dans le premier jeu, game.h utilise déjà ce nom pour un TYPE.
@@ -43,13 +45,104 @@
 static Model mCube, mSphere, mCyl;
 static bool  ready = false;
 
+//----------------------------------------------------------------------------------
+// Lot (batch) : un seul maillage par image
+//----------------------------------------------------------------------------------
+// Les trois maillages unitaires sont « dépliés » une fois pour toutes en
+// listes de triangles (position + normale par sommet). Pendant un lot,
+// chaque primitive transforme ces sommets par sa matrice monde et les
+// ajoute à un grand tampon ; BatchEnd envoie le tampon au GPU et le
+// dessine d'un coup. Le GPU ne reçoit que positions et couleurs : pas de
+// normales, l'ombrage est CUIT dans la couleur de chaque sommet (voir
+// Shade() plus bas), ce qui donne du relief sans shader.
+enum { SRC_CUBE, SRC_SPHERE, SRC_CYL, SRC_COUNT };
+typedef struct { Vector3 *pos, *nrm; int count; } SourceTris;
+static SourceTris src[SRC_COUNT];
+
+// Un tampon par MATÉRIAU : le lot « plat » (personnages, armes : couleur
+// seule, texture blanche) et un lot par texture de la carte. Chaque tampon
+// est un maillage dynamique (positions, couleurs, et texcoords pour les
+// matériaux texturés) dessiné en UN appel à BatchEnd : une dizaine
+// d'appels par image pour tout le monde et toute la carte.
+typedef struct {
+    Mesh           mesh;
+    Material       mat;
+    float         *pos;      // cap * 3
+    unsigned char *col;      // cap * 4
+    float         *uv;       // cap * 2 (NULL pour le lot plat)
+    int            used, cap;
+    float          scale;    // mètres par répétition de la texture
+} BatchBuf;
+static BatchBuf bufs[MAT_COUNT];
+static int      cur_mat = MAT_FLAT;
+static bool     batching = false;
+#define BATCH_FLAT_VERTS 400000   // ~16 personnages + l'enseigne, avec de la marge
+#define BATCH_TEX_VERTS   65536   // la carte : ~400 boîtes de 36 sommets
+
+// Lumière du monde pour l'ombrage cuit : de haut, légèrement de côté
+static const Vector3 LIGHT_DIR = { 0.36f, 0.86f, 0.36f };
+
+// Déplie un maillage raylib (indexé ou non) en liste de triangles
+static void ExpandMesh(const Mesh *m, SourceTris *out)
+{
+    int n = m->triangleCount * 3;
+    out->count = n;
+    out->pos = (Vector3 *)MemAlloc((unsigned)n * sizeof(Vector3));
+    out->nrm = (Vector3 *)MemAlloc((unsigned)n * sizeof(Vector3));
+    for (int i = 0; i < n; i++) {
+        int v = m->indices ? (int)m->indices[i] : i;
+        out->pos[i] = P3(m->vertices[v * 3], m->vertices[v * 3 + 1], m->vertices[v * 3 + 2]);
+        out->nrm[i] = m->normals
+            ? P3(m->normals[v * 3], m->normals[v * 3 + 1], m->normals[v * 3 + 2])
+            : P3(0, 1, 0);
+    }
+}
+
 void ModelsInit(void)
 {
     if (ready) return;
+    // Sphère en 8 x 10 : la finesse du premier EMATournament. Avec le lot,
+    // chaque sommet coûte du CPU et de la bande passante, plus la sphère
+    // est fine, plus l'image est chère.
     mCube   = LoadModelFromMesh(GenMeshCube(1, 1, 1));
-    mSphere = LoadModelFromMesh(GenMeshSphere(1, 12, 16));
-    mCyl    = LoadModelFromMesh(GenMeshCylinder(1, 1, 14));
+    mSphere = LoadModelFromMesh(GenMeshSphere(1, 8, 10));
+    mCyl    = LoadModelFromMesh(GenMeshCylinder(1, 1, 12));
+    ExpandMesh(&mCube.meshes[0],   &src[SRC_CUBE]);
+    ExpandMesh(&mSphere.meshes[0], &src[SRC_SPHERE]);
+    ExpandMesh(&mCyl.meshes[0],    &src[SRC_CYL]);
+
+    // Les maillages des lots : tampons à la taille maximale, mis à jour à
+    // chaque image (UploadMesh dynamique). Pas de normales : raylib leur
+    // donne une valeur par défaut ; pas de texcoords pour le lot plat.
+    for (int m = 0; m < MAT_COUNT; m++) {
+        BatchBuf *b = &bufs[m];
+        memset(b, 0, sizeof(*b));
+        b->cap = (m == MAT_FLAT) ? BATCH_FLAT_VERTS : BATCH_TEX_VERTS;
+        b->scale = 1.0f;
+        b->pos = (float *)MemAlloc((unsigned)b->cap * 3 * sizeof(float));
+        b->col = (unsigned char *)MemAlloc((unsigned)b->cap * 4);
+        if (m != MAT_FLAT) b->uv = (float *)MemAlloc((unsigned)b->cap * 2 * sizeof(float));
+        b->mesh.vertexCount = b->cap;
+        b->mesh.triangleCount = b->cap / 3;
+        b->mesh.vertices = b->pos;
+        b->mesh.colors = b->col;
+        b->mesh.texcoords = b->uv;
+        UploadMesh(&b->mesh, true);
+        b->mat = LoadMaterialDefault();
+    }
     ready = true;
+}
+
+void BatchSetTexture(int mat, Texture2D tex, float scale)
+{
+    if (!ready || mat <= MAT_FLAT || mat >= MAT_COUNT) return;
+    SetMaterialTexture(&bufs[mat].mat, MATERIAL_MAP_DIFFUSE, tex);
+    bufs[mat].scale = (scale > 0.0f) ? scale : 1.0f;
+}
+
+void BatchSetMaterial(int mat)
+{
+    cur_mat = (mat >= 0 && mat < MAT_COUNT) ? mat : MAT_FLAT;
 }
 
 void ModelsClose(void)
@@ -58,15 +151,116 @@ void ModelsClose(void)
     UnloadModel(mCube);
     UnloadModel(mSphere);
     UnloadModel(mCyl);
+    for (int i = 0; i < SRC_COUNT; i++) { MemFree(src[i].pos); MemFree(src[i].nrm); }
+    // Les maillages des lots pointent sur nos tampons : on détache avant de libérer
+    for (int m = 0; m < MAT_COUNT; m++) {
+        BatchBuf *b = &bufs[m];
+        b->mesh.vertices = NULL;
+        b->mesh.colors = NULL;
+        b->mesh.texcoords = NULL;
+        UnloadMesh(b->mesh);
+        // La texture appartient à textures.c : on ne la libère pas ici
+        b->mat.maps[MATERIAL_MAP_DIFFUSE].texture.id = 0;
+        UnloadMaterial(b->mat);
+        MemFree(b->pos);
+        MemFree(b->col);
+        if (b->uv) MemFree(b->uv);
+    }
     ready = false;
 }
 
+// Envoie ce qui est accumulé dans un lot et le dessine en un appel
+static void BatchFlushOne(BatchBuf *b)
+{
+    if (b->used == 0) return;
+    UpdateMeshBuffer(b->mesh, 0, b->pos, b->used * 3 * (int)sizeof(float), 0);   // positions
+    if (b->uv) UpdateMeshBuffer(b->mesh, 1, b->uv, b->used * 2 * (int)sizeof(float), 0);   // texcoords
+    UpdateMeshBuffer(b->mesh, 3, b->col, b->used * 4, 0);                        // couleurs
+    b->mesh.vertexCount = b->used;
+    b->mesh.triangleCount = b->used / 3;
+    DrawMesh(b->mesh, b->mat, MatrixIdentity());
+    b->used = 0;
+}
+
+static void BatchFlush(void)
+{
+    for (int m = 0; m < MAT_COUNT; m++) BatchFlushOne(&bufs[m]);
+}
+
+void BatchBegin(void)
+{
+    if (!ready) return;
+    batching = true;
+    for (int m = 0; m < MAT_COUNT; m++) bufs[m].used = 0;
+    cur_mat = MAT_FLAT;
+}
+
+void BatchEnd(void)
+{
+    if (!ready) return;
+    BatchFlush();
+    batching = false;
+}
+
+// Ajoute un maillage unitaire transformé par world, teinté c, avec
+// l'ombrage cuit dans la couleur : 70 % d'ambiance + 30 % selon l'angle
+// entre la normale et la lumière. Modéré exprès : les couleurs des
+// uniformes et des plumes restent reconnaissables.
+static void BatchAppend(const SourceTris *t, Matrix world, Color c)
+{
+    BatchBuf *b = &bufs[cur_mat];
+    if (b->used + t->count > b->cap) BatchFlushOne(b);   // plein : on dessine et on continue
+    // Les normales se transforment par la partie 3x3 de la matrice (sans
+    // la translation) puis se renormalisent ; avec une mise à l'échelle non
+    // uniforme ce n'est qu'approché, largement assez pour un ombrage.
+    for (int i = 0; i < t->count; i++) {
+        Vector3 p = Vector3Transform(t->pos[i], world);
+        Vector3 n = t->nrm[i];
+        Vector3 wn = {
+            n.x * world.m0 + n.y * world.m4 + n.z * world.m8,
+            n.x * world.m1 + n.y * world.m5 + n.z * world.m9,
+            n.x * world.m2 + n.y * world.m6 + n.z * world.m10,
+        };
+        float len = sqrtf(wn.x * wn.x + wn.y * wn.y + wn.z * wn.z);
+        float d = (len > 1e-6f) ? (wn.x * LIGHT_DIR.x + wn.y * LIGHT_DIR.y + wn.z * LIGHT_DIR.z) / len : 0.0f;
+        float k = 0.70f + 0.30f * (d > 0.0f ? d : 0.0f);
+        float *bp = &b->pos[b->used * 3];
+        bp[0] = p.x; bp[1] = p.y; bp[2] = p.z;
+        unsigned char *bc = &b->col[b->used * 4];
+        bc[0] = (unsigned char)(c.r * k);
+        bc[1] = (unsigned char)(c.g * k);
+        bc[2] = (unsigned char)(c.b * k);
+        bc[3] = c.a;
+        if (b->uv) {
+            // Texcoords « planaires » : la texture est projetée selon l'axe
+            // dominant de la normale, en mètres divisés par l'échelle du
+            // matériau. Les faces d'une boîte se raccordent ainsi sans
+            // étirement, quelle que soit sa taille.
+            float ax = fabsf(wn.x), ay = fabsf(wn.y), az = fabsf(wn.z);
+            float u, v;
+            if (ay >= ax && ay >= az)      { u = p.x; v = p.z; }
+            else if (ax >= az)             { u = p.z; v = p.y; }
+            else                           { u = p.x; v = p.y; }
+            b->uv[b->used * 2]     = u / b->scale;
+            b->uv[b->used * 2 + 1] = v / b->scale;
+        }
+        b->used++;
+    }
+}
+
 // Dessine un maillage avec sa matrice monde et sa teinte (le DrawPart du
-// premier jeu). DrawModel compose model.transform avec la position et
-// l'échelle qu'on lui donne : à (0,0,0) et 1.0, c'est exactement world.
+// premier jeu). Dans un lot : accumulé, dessiné à BatchEnd. Hors lot :
+// DrawModel compose model.transform avec la position et l'échelle qu'on
+// lui donne ; à (0,0,0) et 1.0, c'est exactement world.
 static void DrawPart(Model *m, Matrix world, Color c)
 {
     if (!ready) return;   // appelé avant ModelsInit : on ne dessine rien
+    if (batching) {
+        const SourceTris *t = (m == &mCube) ? &src[SRC_CUBE]
+                            : (m == &mSphere) ? &src[SRC_SPHERE] : &src[SRC_CYL];
+        BatchAppend(t, world, c);
+        return;
+    }
     m->transform = world;
     DrawModel(*m, P3(0, 0, 0), 1.0f, c);
 }
@@ -388,7 +582,21 @@ void DrawChick(Matrix parent, float t, float flap)
 // injectés de sang, cheveux ras, rangers, démarche de zombie bras tendus
 // vers l'avant. Les épaulettes et le brassard prennent la couleur de
 // l'équipe pour reconnaître amis et ennemis d'un coup d'œil.
-void DrawSoldier(Vector3 pos, float yaw, const CharAnim *an, Color team_color)
+void DrawBomb(Matrix parent, float blink, bool planted)
+{
+    const Color CASE = {34, 34, 38, 255};
+    Box3(parent, P3(0, 0.11f, 0), NOROT, P3(0.42f, 0.22f, 0.3f), CASE);
+    Box3(parent, P3(0, 0.225f, 0), NOROT, P3(0.3f, 0.01f, 0.2f), (Color){70, 70, 76, 255});
+    Box3(parent, P3(0, 0.13f, 0.151f), NOROT, P3(0.2f, 0.06f, 0.004f), (Color){60, 90, 70, 255});   // écran
+    Ball(parent, P3(0.15f, 0.2f, 0.12f), P3(0.02f, 0.02f, 0.02f),
+         (Color){(unsigned char)(90 + 165 * blink), (unsigned char)(20 + 20 * blink), 20, 255});
+    if (planted) {
+        Seg(parent, P3(-0.15f, 0.22f, -0.1f), P3(-0.15f, 0.6f, -0.1f), 0.006f, (Color){120, 120, 125, 255});
+        Ball(parent, P3(-0.15f, 0.6f, -0.1f), P3(0.012f, 0.012f, 0.012f), (Color){120, 120, 125, 255});
+    }
+}
+
+void DrawSoldier(Vector3 pos, float yaw, const CharAnim *an, Color team_color, int weapon, bool has_bomb)
 {
     // Palette (reprise du premier jeu)
     const Color UNIFORM = {88, 96, 68, 255};     // treillis olive
@@ -450,6 +658,11 @@ void DrawSoldier(Vector3 pos, float yaw, const CharAnim *an, Color team_color)
                        MatrixTranslate(0, bob + breathe - an->land * live * 0.08f, -fl * 0.06f)),
         stance);
 
+    // --- La bombe sur le dos, quand il la porte ---
+    if (has_bomb)
+        DrawBomb(MatrixMultiply(MatrixMultiply(MatrixRotateX(PI / 2), MatrixTranslate(0, 1.25f, -0.2f)), body),
+                 0.5f + 0.5f * sinf(an->t * 6.0f), false);
+
     // --- Bassin, ceinturon ---
     Ball(body, P3(0, 0.98f, 0), P3(0.185f, 0.12f, 0.125f), PANTS);
     Ball(body, P3(0, 1.04f, 0), P3(0.19f, 0.035f, 0.132f), (Color){24, 24, 24, 255});
@@ -460,13 +673,49 @@ void DrawSoldier(Vector3 pos, float yaw, const CharAnim *an, Color team_color)
          P3(0.215f + breathe * 1.5f, 0.2f, 0.14f + breathe * 2.0f), UNIFORM);
     Ball(body, P3(0, 1.48f, 0), P3(0.25f, 0.09f, 0.13f), UNIFORM);
 
-    // --- Bras tendus vers l'avant, démarche de zombie (comme le premier
-    // jeu) : ils balancent doucement en opposition à la marche ---
+    // --- L'arme, épaulée devant la poitrine. Son repère a le canon vers
+    // -Z et le soldat regarde vers +Z : on la retourne, on la pose un peu
+    // à droite, et chaque coup (attack) la fait reculer vers l'épaule. Les
+    // mains vont se poser sur sa poignée et son garde-main. ---
+    bool armed = (weapon >= 0 && weapon < WPN_CLAWS);
+    float rec = an->attack * live;
+    Matrix gun = MatrixMultiply(
+        MatrixMultiply(MatrixRotateY(PI), MatrixRotateX(-0.08f + rec * 0.1f)),
+        MatrixTranslate(0.11f, 1.3f + sw * 0.01f, 0.26f - rec * 0.05f));
+    if (armed) {
+        WeaponPose wp = {0};
+        wp.muzzle = (an->attack > 0.85f) ? 1.0f : 0.0f;   // flash juste au coup
+        wp.bolt = rec;
+        DrawWeaponModel(MatrixMultiply(gun, body), weapon, &wp);
+    }
+    Vector3 grip_r = {0.21f, 1.44f, 0.54f}, grip_l = {-0.21f, 1.44f, 0.54f};
+    if (armed) {
+        Vector3 r, l;
+        WeaponGrips(weapon, &r, &l);
+        grip_r = Vector3Transform(r, gun);
+        grip_l = Vector3Transform(l, gun);
+    }
+
+    // --- Bras : sur l'arme s'il en a une, sinon tendus vers l'avant,
+    // démarche de zombie (comme le premier jeu), balançant doucement en
+    // opposition à la marche ---
     for (int k = -1; k <= 1; k += 2) {
         float s = sw * k;
         Vector3 shoulder = {0.235f * k, 1.47f, 0};
-        Vector3 elbow = {0.26f * k, 1.42f + s * 0.02f, 0.27f + s * 0.04f};
-        Vector3 hand = {0.21f * k, 1.44f + s * 0.05f, 0.54f + s * 0.06f};
+        Vector3 hand, elbow;
+        if (armed) {
+            // Le bras du côté +X (celui de la crosse, l'arme étant décalée
+            // en +X) tient la poignée ; l'autre tient le garde-main.
+            hand = (k > 0) ? grip_r : grip_l;
+            // Le coude tombe sous la ligne épaule-main, vers l'extérieur
+            elbow = Vector3Lerp(shoulder, hand, 0.5f);
+            elbow.x += 0.1f * k;
+            elbow.y -= 0.13f;
+            elbow.z -= 0.03f;
+        } else {
+            elbow = (Vector3){0.26f * k, 1.42f + s * 0.02f, 0.27f + s * 0.04f};
+            hand = (Vector3){0.21f * k, 1.44f + s * 0.05f, 0.54f + s * 0.06f};
+        }
         // Manche retroussée : treillis jusqu'à 82 % du coude, revers roulé
         Vector3 cuff = Vector3Lerp(shoulder, elbow, 0.82f);
         Limb(body, shoulder, cuff, 0.062f, UNIFORM);

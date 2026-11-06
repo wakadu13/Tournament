@@ -34,6 +34,23 @@
 void ModelsInit(void);    // crée le cube, la sphère et le cylindre (après InitWindow)
 void ModelsClose(void);   // les libère (avant CloseWindow)
 
+// Regroupement des primitives en UN SEUL maillage par image. Entre
+// BatchBegin et BatchEnd, chaque Ball / Box3 / Seg n'est plus un appel de
+// dessin : ses sommets sont transformés sur le CPU et ajoutés à un maillage
+// dynamique, envoyé et dessiné une fois à BatchEnd. Tous les personnages et
+// l'enseigne tiennent dans un appel au lieu d'un millier — c'est ce qui
+// compte sur un téléphone, où chaque appel coûte cher. Hors d'un lot, les
+// primitives se dessinent une à une comme avant.
+void BatchBegin(void);
+void BatchEnd(void);
+
+// Matériaux du lot. MAT_FLAT : couleur seule (personnages, armes). Les
+// autres portent une texture (voir textures.c) projetée sur les faces :
+// la carte s'en sert, avec BatchSetMaterial avant chaque primitive.
+enum { MAT_FLAT = 0, MAT_SAND, MAT_WALL, MAT_WOOD, MAT_STONE, MAT_METAL, MAT_CLOTH, MAT_ROOF, MAT_COUNT };
+void BatchSetMaterial(int mat);                              // pour les primitives qui suivent
+void BatchSetTexture(int mat, Texture2D tex, float scale);   // scale = mètres par répétition
+
 //----------------------------------------------------------------------------------
 // Primitives (mêmes signatures que render.h du premier jeu)
 //----------------------------------------------------------------------------------
@@ -115,8 +132,14 @@ void CharAnimLookAt(CharAnim *a, Vector3 self, float yaw, Vector3 target, bool h
 // Les modèles
 //----------------------------------------------------------------------------------
 // Le soldat-mercenaire : les JOUEURS humains (treillis olive, visage peint
-// en vert, démarche de zombie bras tendus).
-void DrawSoldier(Vector3 pos, float yaw, const CharAnim *a, Color team_color);
+// en vert). weapon = WeaponId de l'arme qu'il tient (voir weapons.h) ;
+// sans arme valide, il marche bras tendus comme un zombie.
+void DrawSoldier(Vector3 pos, float yaw, const CharAnim *a, Color team_color, int weapon, bool has_bomb);
+
+// La bombe : une mallette sombre avec sa diode rouge (blink = 0..1 :
+// intensité de la diode) et, posée, son antenne. Repère : origine au sol
+// sous la mallette.
+void DrawBomb(Matrix parent, float blink, bool planted);
 
 // Le poussin zombie : les BOTS (poussin humanoïde d'1m60 ensanglanté).
 void DrawZombieChick(Vector3 pos, float yaw, const CharAnim *a, Color team_color);

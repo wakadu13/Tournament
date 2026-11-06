@@ -31,10 +31,15 @@
 typedef struct {
     Vector2 move;      // -1..1 : x = vers la droite, y = vers l'avant
     Vector2 look;      // rotation demandée cette image, en RADIANS (x = yaw, y = pitch)
-    bool    fire;      // tirer
+    bool    fire;      // tirer (maintenu)
+    bool    fire_pressed; // tirer : le bouton vient d'être enfoncé (armes semi-automatiques)
     bool    aim;       // viser (point rouge)
     bool    jump;      // sauter
     bool    sprint;    // courir
+    bool    reload;    // recharger (impulsion)
+    bool    swap;      // changer d'arme (impulsion)
+    bool    menu;      // ouvrir le menu (impulsion)
+    bool    use;       // action maintenue : poser / désamorcer la bombe
 } PlayerInput;
 
 void TouchReset(void);   // oublie tous les doigts (début de partie)
@@ -51,5 +56,7 @@ void TouchApply(PlayerInput *in, float ads);
 
 void TouchDraw(void);    // joystick et boutons, en unités d'interface
 bool TouchUsed(void);    // vrai si les commandes tactiles sont actives
+void TouchSetSensitivity(float mult);   // multiplicateur de la visée au doigt (options)
+void TouchSetAmmoLabel(const char *text); // texte du bouton d'arme (ex. « 25|75 »)
 
 #endif // TOUCH_H

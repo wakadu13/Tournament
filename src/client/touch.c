@@ -9,6 +9,7 @@
 #include "touch.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "raymath.h"
@@ -34,6 +35,8 @@ void TouchUpdate(float ui_scale, float screen_w, float screen_h)
 void TouchApply(PlayerInput *in, float ads) { (void)in; (void)ads; }
 void TouchDraw(void) {}
 bool TouchUsed(void) { return false; }
+void TouchSetSensitivity(float mult) { (void)mult; }
+void TouchSetAmmoLabel(const char *text) { (void)text; }
 
 #else   // ===================== mobile =====================
 
@@ -44,7 +47,7 @@ bool TouchUsed(void) { return false; }
 #define SPRINT_PUSH   0.85f    // joystick poussé au-delà = sprint
 
 // Rôle d'un doigt, choisi à l'endroit où il se pose
-typedef enum { TR_NONE, TR_JOY, TR_LOOK, TR_FIRE, TR_AIM, TR_JUMP, TR_COUNT } TouchRole;
+typedef enum { TR_NONE, TR_JOY, TR_LOOK, TR_FIRE, TR_AIM, TR_JUMP, TR_RELOAD, TR_SWAP, TR_MENU, TR_USE, TR_COUNT } TouchRole;
 
 // Un doigt suivi d'une image à l'autre
 typedef struct {
@@ -64,17 +67,30 @@ static Vector2 joy_base;       // centre du joystick actif (unités d'interface)
 static bool    joy_on;         // un doigt tient le joystick
 static Vector2 look_delta;     // glissement de visée cumulé cette image
 static bool    held[TR_COUNT]; // boutons maintenus cette image
+static bool    pressed[TR_COUNT]; // boutons qui viennent d'être enfoncés (impulsion)
+static bool    was_held[TR_COUNT];
 static bool    aim_toggle;     // VISER est une bascule, pas un maintien
 static bool    aim_was_down;   // pour ne basculer qu'au moment de l'appui
 static float   vw = 1280.0f, vh = 720.0f;   // écran en unités d'interface
+static float   sens_mult = 1.0f;            // réglage de sensibilité (options)
+static char    ammo_label[24] = "ARME";     // texte du bouton de changement d'arme
 
-// Position des boutons, calée sur le coin bas droit (TIRER sous le pouce).
+// Position des boutons, calée sur le coin bas droit (TIRER sous le pouce),
+// décalée de 44 unités vers la gauche : la barre de navigation Android à
+// trois boutons occupe ~90 unités du bord droit et chevauchait TIRER.
+// RECHARGER et ARME (changement) complètent la grappe ; MENU est en haut
+// à gauche, hors de la zone du joystick (qui commence à 22 % de la hauteur).
+#define BUTTON_MAX 7
 static int Buttons(Button *b)
 {
     int n = 0;
-    b[n++] = (Button){ TR_FIRE, { vw - 112.0f, vh - 112.0f }, 60 };
-    b[n++] = (Button){ TR_AIM,  { vw - 236.0f, vh -  64.0f }, 38 };
-    b[n++] = (Button){ TR_JUMP, { vw -  64.0f, vh - 236.0f }, 36 };
+    b[n++] = (Button){ TR_FIRE,   { vw - 156.0f, vh - 112.0f }, 60 };
+    b[n++] = (Button){ TR_AIM,    { vw - 280.0f, vh -  64.0f }, 38 };
+    b[n++] = (Button){ TR_JUMP,   { vw - 108.0f, vh - 236.0f }, 36 };
+    b[n++] = (Button){ TR_RELOAD, { vw - 250.0f, vh - 190.0f }, 34 };
+    b[n++] = (Button){ TR_SWAP,   { vw - 108.0f, vh - 330.0f }, 32 };
+    b[n++] = (Button){ TR_MENU,   { 44.0f, 44.0f }, 26 };
+    b[n++] = (Button){ TR_USE,    { vw - 250.0f, vh - 290.0f }, 30 };   // BOMBE : maintenu
     return n;
 }
 
@@ -85,7 +101,7 @@ static int Buttons(Button *b)
 //  - partout ailleurs : visée.
 static TouchRole HitTest(Vector2 p)
 {
-    Button b[4];
+    Button b[BUTTON_MAX];
     int n = Buttons(b);
     for (int i = 0; i < n; i++)
         if (Vector2Distance(p, b[i].c) < b[i].r * 1.15f) return b[i].role;
@@ -114,8 +130,16 @@ void TouchReset(void)
     joy_on = false;
     look_delta = (Vector2){0};
     memset(held, 0, sizeof(held));
+    memset(pressed, 0, sizeof(pressed));
+    memset(was_held, 0, sizeof(was_held));
     aim_toggle = false;
     aim_was_down = false;
+}
+
+void TouchSetSensitivity(float mult) { sens_mult = (mult > 0.0f) ? mult : 1.0f; }
+void TouchSetAmmoLabel(const char *text)
+{
+    snprintf(ammo_label, sizeof(ammo_label), "%s", text ? text : "ARME");
 }
 
 bool TouchUsed(void) { return true; }
@@ -128,6 +152,7 @@ void TouchUpdate(float ui_scale, float screen_w, float screen_h)
 
     // Repartir de zéro pour ce qui ne vaut qu'une image
     look_delta = (Vector2){0};
+    memcpy(was_held, held, sizeof(held));
     memset(held, 0, sizeof(held));
     for (int i = 0; i < MAX_FINGERS; i++) fingers[i].seen = false;
 
@@ -201,12 +226,18 @@ void TouchUpdate(float ui_scale, float screen_w, float screen_h)
             aim_down = true;
             break;
         case TR_JUMP:
-            held[TR_JUMP] = true;
+        case TR_RELOAD:
+        case TR_SWAP:
+        case TR_MENU:
+        case TR_USE:
+            held[f->role] = true;
             break;
         default:
             break;
         }
     }
+    // Impulsions : le bouton n'était pas tenu à l'image précédente
+    for (int r = 0; r < TR_COUNT; r++) pressed[r] = held[r] && !was_held[r];
 
     // VISER est une bascule : on n'inverse qu'au moment où le doigt se pose
     if (aim_down && !aim_was_down) aim_toggle = !aim_toggle;
@@ -219,12 +250,17 @@ void TouchApply(PlayerInput *in, float ads)
     in->move.y += joy.y;
 
     // Visée : même atténuation en ADS qu'à la souris
-    float sens = TOUCH_SENS * (1.0f - ads * 0.35f);
+    float sens = TOUCH_SENS * sens_mult * (1.0f - ads * 0.35f);
     in->look.x += -look_delta.x * sens;
     in->look.y += -look_delta.y * sens;
 
-    if (held[TR_FIRE]) in->fire = true;
-    if (held[TR_JUMP]) in->jump = true;
+    if (held[TR_FIRE])    in->fire = true;
+    if (pressed[TR_FIRE]) in->fire_pressed = true;
+    if (held[TR_JUMP])    in->jump = true;
+    if (pressed[TR_RELOAD]) in->reload = true;
+    if (pressed[TR_SWAP])   in->swap = true;
+    if (pressed[TR_MENU])   in->menu = true;
+    if (held[TR_USE])       in->use = true;
     if (aim_toggle)    in->aim = true;
     // Sprint : joystick poussé à fond vers l'avant
     if (joy.y > SPRINT_PUSH) in->sprint = true;
@@ -242,7 +278,7 @@ void TouchDraw(void)
     }
 
     // --- Boutons -------------------------------------------------------
-    Button b[4];
+    Button b[BUTTON_MAX];
     int n = Buttons(b);
     for (int i = 0; i < n; i++) {
         bool on = (b[i].role == TR_AIM) ? aim_toggle : held[b[i].role];
@@ -250,9 +286,13 @@ void TouchDraw(void)
         DrawCircleV(b[i].c, b[i].r, fill);
         DrawCircleLines((int)b[i].c.x, (int)b[i].c.y, b[i].r, Fade(RAYWHITE, 0.5f));
 
-        const char *label = (b[i].role == TR_FIRE) ? "TIRER"
-                          : (b[i].role == TR_AIM)  ? "VISER" : "SAUT";
-        int size = (b[i].role == TR_FIRE) ? 20 : 16;
+        const char *label = (b[i].role == TR_FIRE)   ? "TIRER"
+                          : (b[i].role == TR_AIM)    ? "VISER"
+                          : (b[i].role == TR_JUMP)   ? "SAUT"
+                          : (b[i].role == TR_RELOAD) ? "RECH."
+                          : (b[i].role == TR_USE)    ? "BOMBE"
+                          : (b[i].role == TR_SWAP)   ? ammo_label : "MENU";
+        int size = (b[i].role == TR_FIRE) ? 20 : (b[i].role == TR_SWAP || b[i].role == TR_USE ? 13 : 16);
         DrawText(label, (int)b[i].c.x - MeasureText(label, size) / 2,
                  (int)b[i].c.y - size / 2, size, Fade(RAYWHITE, 0.85f));
     }

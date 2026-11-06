@@ -44,7 +44,13 @@
 #include "../common/protocol.h"
 #include "../common/game.h"
 #include "models.h"   // modèles 3D des personnages (soldat / poussin zombie)
+#include "textures.h" // textures procédurales de la carte
+#include "sound.h"    // sons synthétisés
+#include "weapons.h"  // modèles 3D des armes
 #include "touch.h"    // commandes tactiles (mobile) et structure PlayerInput
+#include "options.h"  // réglages persistants (options.cfg)
+#include "ui.h"       // widgets des menus
+#include "menu.h"     // accueil, pause, équipement, options
 
 //----------------------------------------------------------------------------------
 // Réglages de la vue FPS
@@ -52,7 +58,7 @@
 #define SCREEN_W 1280
 #define SCREEN_H 720
 
-#define MOUSE_SENSITIVITY 0.0025f  // radians par pixel de souris
+#define MOUSE_SENSITIVITY 0.0025f  // radians par pixel de souris (x options.sensitivity)
 
 // Interface mobile : écran de connexion au doigt et commandes tactiles.
 // Même interrupteur que TOUCH_ENABLED dans touch.c, pour que les deux
@@ -69,9 +75,11 @@
 //----------------------------------------------------------------------------------
 // Le HUD est dessiné en UNITÉS D'INTERFACE : 720 de haut, largeur selon le
 // ratio de l'écran. Sur PC la fenêtre fait exactement SCREEN_W x SCREEN_H et
-// une unité vaut un pixel ; sur un téléphone l'écran est bien plus grand et
-// plus large, et BeginMode2D met tout à l'échelle d'un coup. Sans ça le HUD
-// se tasserait dans un coin de l'écran.
+// une unité vaut un pixel. Sur Android la fenêtre a la taille native de
+// l'écran (InitWindow(0, 0)), bien plus grand et souvent en 20:9 : l'échelle
+// suit la hauteur, la largeur virtuelle suit le ratio, et BeginMode2D met
+// tout à l'échelle d'un coup. Les boutons gardent ainsi la même taille
+// relative d'un téléphone à une tablette, sans bande noire.
 #define UI_H 720                      // hauteur de référence
 static float ui_scale = 1.0f;         // pixels réels par unité d'interface
 static float ui_w = (float)SCREEN_W;  // largeur de l'écran EN UNITÉS
@@ -98,16 +106,13 @@ static Camera2D UiCamera(void)
 }
 
 // Champ de vision (degrés) selon la situation. La valeur réelle rejoint
-// la cible en douceur à chaque frame (pas de saut brutal).
-#define FOV_HIP    75.0f           // normal, arme à la hanche
-#define FOV_ADS    50.0f           // en visant : effet de zoom
-#define FOV_SPRINT 84.0f           // en sprint : impression de vitesse
+// la cible en douceur à chaque frame (pas de saut brutal). La base est
+// réglable (options.fov) ; la visée zoome de 25°, la lunette bien plus.
+#define FOV_HIP    (options.fov)             // normal, arme à la hanche
+#define FOV_ADS    (options.fov - 25.0f)     // en visant : effet de zoom
+#define FOV_SCOPE  12.0f                     // dans la lunette du FR-F2
+#define FOV_SPRINT (options.fov + 9.0f)      // en sprint : impression de vitesse
 
-#define SPRINT_SPEED      10.5f    // m/s en sprint (PLAYER_SPEED sinon)
-#define ACCEL_GROUND      12.0f    // accélération au sol (réactif)
-#define ACCEL_AIR         2.5f     // en l'air : faible contrôle aérien
-
-#define INTERP_SPEED      15.0f    // vitesse de lissage des autres joueurs
 
 #define KILLFEED_MAX   5
 #define KILLFEED_TTL   5.0f        // durée d'affichage d'une ligne (s)
@@ -138,17 +143,68 @@ static CharAnim anim[MAX_PLAYERS];
 //----------------------------------------------------------------------------------
 // État local du joueur (prédiction)
 //----------------------------------------------------------------------------------
-static V3    my_pos;               // position des PIEDS (comme sur le serveur)
-static V3    my_vel = {0};         // vitesse horizontale actuelle (m/s)
-static float my_vel_y = 0.0f;      // vitesse verticale (saut / gravité)
+// Notre simulation (position des pieds, vitesses, au sol) : le MÊME code
+// que le serveur (PlayerStep, game.c). On la fait tourner en avance sur lui
+// (prédiction) et on se recale sur ses snapshots (réconciliation).
+static PlayerSim my_sim;
 static float my_yaw = 0.0f;        // regard gauche/droite (radians)
 static float my_pitch = 0.0f;      // regard haut/bas (radians)
 static bool  my_alive = true;      // décidé par le serveur
 static uint8_t my_spawn_count = 0; // compteur de respawn (voir protocol.h)
-static bool  on_ground = true;
 static bool  sprinting = false;
 static float dead_t = 0.0f;        // temps écoulé depuis notre mort (anim caméra)
 static int   last_health = PLAYER_MAX_HEALTH;
+
+static void SnapPush(const PacketSnapshot *sp);
+static void Reconcile(const SnapshotPlayer *me);
+
+//----------------------------------------------------------------------------------
+// Prédiction et réconciliation
+//----------------------------------------------------------------------------------
+// Chaque image produit UNE entrée (déplacement, vue, saut...), simulée
+// tout de suite et gardée ici jusqu'à ce que le serveur l'acquitte
+// (champ last_seq du snapshot). À chaque snapshot on repart de l'état que
+// le serveur nous donne et on rejoue les entrées qu'il n'a pas encore vues.
+#define PENDING_MAX 256                    // ~1,8 s à 144 images/s : largement plus qu'un ping
+static InputEntry pending[PENDING_MAX];    // anneau : head = plus ancienne
+static int        pending_head = 0, pending_count = 0;
+static uint16_t   my_seq = 0;              // numéro de la dernière entrée produite
+
+static InputEntry PendingAt(int i) { return pending[(pending_head + i) % PENDING_MAX]; }
+static void PendingPush(const InputEntry *e)
+{
+    if (pending_count == PENDING_MAX) {    // plein : on oublie la plus ancienne
+        pending_head = (pending_head + 1) % PENDING_MAX;
+        pending_count--;
+    }
+    pending[(pending_head + pending_count) % PENDING_MAX] = *e;
+    pending_count++;
+}
+// Retire toutes les entrées jusqu'à seq compris (différence signée sur
+// 16 bits : gère le bouclage du compteur)
+static void PendingAck(uint16_t seq)
+{
+    while (pending_count > 0 && (int16_t)(PendingAt(0).seq - seq) <= 0) {
+        pending_head = (pending_head + 1) % PENDING_MAX;
+        pending_count--;
+    }
+}
+
+//----------------------------------------------------------------------------------
+// Interpolation des autres joueurs
+//----------------------------------------------------------------------------------
+// Les snapshots n'arrivent que 20 fois/s : on affiche les autres joueurs
+// INTERP_DELAY dans le passé, entre les deux snapshots qui encadrent cet
+// instant. Le mouvement est fluide et, surtout, ce qu'on voit correspond à
+// un instant serveur PRÉCIS : c'est lui qu'on envoie avec nos tirs, et le
+// serveur rembobine les cibles à cet instant (compensation de lag).
+#define SNAP_BUF 32
+typedef struct { PacketSnapshot snap; bool valid; } SnapEntry;
+static SnapEntry snapbuf[SNAP_BUF];        // anneau indexé par le tick
+static double server_offset = 0.0;         // temps serveur ~= GetTime() + server_offset
+static bool   have_offset = false;
+static float  view_time = 0.0f;            // instant serveur affiché cette image
+static float  display_yaw[MAX_PLAYERS];    // orientation interpolée
 
 //----------------------------------------------------------------------------------
 // État de l'arme et des animations de la vue
@@ -167,6 +223,46 @@ static Vector2 sway = {0};         // l'arme "traîne" derrière la souris
 static float shoot_cooldown = 0.0f;
 static float hit_marker_timer = 0.0f;    // réticule rouge quand on touche
 static float damage_flash_timer = 0.0f;  // voile rouge quand on est touché
+
+//----------------------------------------------------------------------------------
+// Armes (côté client)
+//----------------------------------------------------------------------------------
+// Le serveur tient les chargeurs (voir server/main.c). Ici on garde ce
+// qu'il nous a dit au dernier snapshot, moins nos tirs encore en route,
+// et des minuteurs LOCAUX de rechargement / changement d'arme pour
+// l'animation et pour ne pas tirer dans le vide (le serveur les refuserait).
+static int      my_weapon[WEAPON_SLOTS] = { WPN_FAMAS, WPN_GLOCK };  // ce qu'on tient
+static int      my_slot = SLOT_PRIMARY;      // emplacement actif
+static int      my_mag[WEAPON_SLOTS];        // cartouches affichées (snapshot - tirs en route)
+static int      my_reserve[WEAPON_SLOTS];
+static uint16_t my_shot_seq = 0;             // numéro de notre dernier tir
+static float    reload_t = 0.0f;             // rechargement local (s restantes)
+static float    reload_total = 1.0f;         // sa durée, pour l'animation
+static float    switch_t = 0.0f;             // changement d'arme local (s restantes)
+static float    bolt_t = 0.0f;               // réarmement (verrou, pompe, glissière) : 1 -> 0
+static bool     fire_was_down = false;       // front du bouton de tir (coup par coup)
+static char     weapon_msg[96] = "";         // « équipement appliqué » ...
+static float    weapon_msg_t = 0.0f;
+static bool     scoped = false;              // dans la lunette (FR-F2 en visée)
+
+// --- La bombe, et ce qu'on en montre ---
+static float   explosion_t = 0.0f;        // 1 -> 0 : l'explosion en cours (boule, flash)
+static Vector3 explosion_pos;
+static float   beep_t = 0.0f;             // prochain bip de la bombe posée
+static float   use_tick_t = 0.0f;         // prochain tic pendant qu'on pose / désamorce
+static int     round_end_reason = RE_ELIMINATION;
+
+// --- Sons de pas ---
+static int   last_step = 0;               // numéro du dernier pas joué (local)
+static bool  was_on_ground = true;
+static float last_vel_y = 0.0f;
+static int   other_step[MAX_PLAYERS];     // idem pour chaque autre joueur
+
+// Menu ouvert en jeu (pause, armes, options) ; MENU_NONE = on joue
+static MenuScreen menu = MENU_NONE;
+static bool       quit_requested = false;
+
+static const WeaponStats *CurWeapon(void) { return &WEAPONS[my_weapon[my_slot]]; }
 
 //----------------------------------------------------------------------------------
 // Effets : fil des kills et traçantes
@@ -244,16 +340,18 @@ static bool NetConnect(const char *ip, const char *name)
         sendto(sock_fd, &pkt, sizeof(pkt), 0,
                (struct sockaddr *)&server_addr, sizeof(server_addr));
 
-        // On écoute la réponse pendant une demi-seconde
-        double deadline = GetTime() + 0.5;
-        while (GetTime() < deadline) {
+        // On écoute la réponse pendant une demi-seconde. PlatformNow et
+        // pas GetTime : sur PC on peut se connecter AVANT d'ouvrir la
+        // fenêtre, et l'horloge de raylib ne démarre qu'avec elle.
+        double deadline = PlatformNow() + 0.5;
+        while (PlatformNow() < deadline) {
             uint8_t buf[2048];
             sock_ssize_t n = recvfrom(sock_fd, buf, sizeof(buf), 0, NULL, NULL);
             if (n >= (sock_ssize_t)sizeof(PacketAccept) && buf[0] == PKT_SV_ACCEPT) {
                 PacketAccept *acc = (PacketAccept *)buf;
                 my_id = acc->player_id;       // le serveur nous donne notre slot
                 my_team = (Team)acc->team;    // et notre équipe (auto-équilibrage)
-                last_server_msg = GetTime();
+                last_server_msg = -1.0;       // posé à la première image de jeu
                 printf("Connecté : id %d, équipe %s\n", my_id,
                        my_team == TEAM_RED ? "ROUGE" : "BLEUE");
                 return true;
@@ -272,13 +370,20 @@ static bool NetConnect(const char *ip, const char *name)
 }
 
 // Envoie notre position/orientation (appelé CLIENT_SEND_HZ fois par seconde)
-static void NetSendState(void)
+// Envoie les INPUT_BATCH dernières entrées (ou moins). Les mêmes repartent
+// dans plusieurs paquets de suite : si l'un se perd, le suivant les porte.
+// Sans entrée en attente (mort, fin de match), le paquet part vide : il
+// sert alors de battement de cœur contre le timeout du serveur.
+static void NetSendInputs(void)
 {
-    PacketClientState pkt = {
-        PKT_CL_STATE, (uint8_t)my_id, my_spawn_count,
-        my_pos.x, my_pos.y, my_pos.z,
-        my_yaw, my_pitch,
-    };
+    PacketClientInput pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = PKT_CL_INPUT;
+    pkt.player_id = (uint8_t)my_id;
+    pkt.spawn_count = my_spawn_count;
+    int n = (pending_count < INPUT_BATCH) ? pending_count : INPUT_BATCH;
+    for (int i = 0; i < n; i++) pkt.entries[i] = PendingAt(pending_count - n + i);
+    pkt.count = (uint8_t)n;
     sendto(sock_fd, &pkt, sizeof(pkt), 0,
            (struct sockaddr *)&server_addr, sizeof(server_addr));
 }
@@ -289,9 +394,20 @@ static void NetSendShoot(V3 origin, V3 dir)
 {
     PacketShoot pkt = {
         PKT_CL_SHOOT, (uint8_t)my_id,
+        (uint8_t)my_slot, 0, ++my_shot_seq,   // l'arme avec laquelle on tire, et le numéro du tir
         origin.x, origin.y, origin.z,
         dir.x, dir.y, dir.z,
+        view_time,                 // l'instant qu'on voyait : le serveur y rembobine les cibles
     };
+    sendto(sock_fd, &pkt, sizeof(pkt), 0,
+           (struct sockaddr *)&server_addr, sizeof(server_addr));
+}
+
+// Équipement, changement d'arme, rechargement : le serveur fait autorité
+// (voir HandleWeapon côté serveur), on anime en attendant sa réponse.
+static void NetSendWeapon(int action, int a, int b)
+{
+    PacketWeapon pkt = { PKT_CL_WEAPON, (uint8_t)my_id, (uint8_t)action, (uint8_t)a, (uint8_t)b };
     sendto(sock_fd, &pkt, sizeof(pkt), 0,
            (struct sockaddr *)&server_addr, sizeof(server_addr));
 }
@@ -315,18 +431,25 @@ static void HandleEvent(const PacketEvent *ev)
 {
     char line[64];
     switch (ev->event) {
-    case EV_KILL:
-        snprintf(line, sizeof(line), "%s a éliminé %s",
-                 PlayerName(ev->a), PlayerName(ev->b));
+    case EV_KILL: {
+        int w = ev->value & 0xFF;
+        bool head = (ev->value & 0x100) != 0;
+        if (w == WPN_COUNT)
+            snprintf(line, sizeof(line), "%s a été soufflé par la bombe", PlayerName(ev->b));
+        else
+            snprintf(line, sizeof(line), "%s a éliminé %s (%s%s)",
+                     PlayerName(ev->a), PlayerName(ev->b),
+                     (w >= 0 && w < WPN_COUNT) ? WEAPONS[w].name : "?", head ? ", tête" : "");
         KillfeedPush(line);
+    }
         if (ev->a == my_id) hit_marker_timer = 0.3f;   // c'est nous le tueur
         // Le tueur porte son coup. La victime, elle, s'effondre dès que le
         // snapshot la donne pour morte (CharAnimUpdate s'en charge).
         if (ev->a < MAX_PLAYERS) CharAnimAttack(&anim[ev->a]);
         break;
     case EV_HIT:
-        if (ev->a == my_id) hit_marker_timer = 0.15f;  // on a touché quelqu'un
-        if (ev->b == my_id) damage_flash_timer = 0.25f; // on a été touché
+        if (ev->a == my_id && ev->b != my_id) { hit_marker_timer = 0.15f; SoundPlay(SND_HITMARK, 0.6f, 1.0f); }
+        if (ev->b == my_id) { damage_flash_timer = 0.25f; SoundPlay(SND_HURT, 0.9f, 1.0f); }
         // Celui qui frappe porte son coup (pour un bot : le bond de griffe,
         // bec qui claque) et celui qui encaisse sursaute.
         if (ev->a < MAX_PLAYERS) CharAnimAttack(&anim[ev->a]);
@@ -337,12 +460,67 @@ static void HandleEvent(const PacketEvent *ev)
         // sinon son cadavre se relèverait avant de se téléporter.
         if (ev->a < MAX_PLAYERS) CharAnimTeleport(&anim[ev->a]);
         break;
+    case EV_ROUND_START:
+        snprintf(line, sizeof(line), "Manche %d", ev->a);
+        KillfeedPush(line);
+        SoundPlay(SND_ROUND_START, 0.7f, 1.0f);
+        break;
+    case EV_ROUND_END:
+        round_end_reason = ev->value;
+        if (ev->a < TEAM_COUNT) {
+            snprintf(line, sizeof(line), "Manche %d : %s l'emporte", ev->b,
+                     ev->a == TEAM_RED ? "ROUGE" : "BLEU");
+            SoundPlay(ev->a == my_team ? SND_WIN : SND_LOSE, 0.7f, 1.0f);
+        } else
+            snprintf(line, sizeof(line), "Manche %d : nulle", ev->b);
+        KillfeedPush(line);
+        break;
+    case EV_MATCH_OVER:
+        SoundPlay(ev->a == my_team ? SND_WIN : SND_LOSE, 0.9f, 0.8f);
+        break;
+    case EV_SHOT:
+        // Le tir d'un autre : on l'entend d'où il est (le nôtre est joué
+        // tout de suite dans Shoot, sans attendre le serveur)
+        if (ev->a != my_id && ev->a < MAX_PLAYERS && has_display[ev->a]) {
+            Vector3 at = {display_pos[ev->a].x, display_pos[ev->a].y + PLAYER_EYE_HEIGHT, display_pos[ev->a].z};
+            SoundPlayAt(SoundForWeapon(ev->value), at, 1.0f, ev->value == WPN_CLAWS ? 30.0f : 120.0f);
+        }
+        break;
+    case EV_BOMB_PLANTED:
+        snprintf(line, sizeof(line), "%s a posé la bombe sur le site %c", PlayerName(ev->a), 'A' + ev->b);
+        KillfeedPush(line);
+        SoundPlay(SND_PLANT, 0.8f, 1.0f);
+        beep_t = 0.0f;
+        break;
+    case EV_BOMB_DEFUSED:
+        snprintf(line, sizeof(line), "%s a désamorcé la bombe", PlayerName(ev->a));
+        KillfeedPush(line);
+        SoundPlay(SND_DEFUSE, 0.8f, 1.0f);
+        break;
+    case EV_BOMB_EXPLODED:
+        KillfeedPush("La bombe a explosé");
+        explosion_t = 1.0f;
+        explosion_pos = (Vector3){snap.bomb_x, snap.bomb_y, snap.bomb_z};
+        SoundPlayAt(SND_EXPLOSION, explosion_pos, 1.0f, 400.0f);
+        break;
+    case EV_BOMB_DROPPED:
+        KillfeedPush("La bombe est au sol");
+        break;
+    case EV_BOMB_PICKED:
+        snprintf(line, sizeof(line), "%s porte la bombe", PlayerName(ev->a));
+        KillfeedPush(line);
+        break;
     case EV_PLAYER_JOIN:
         snprintf(line, sizeof(line), "%s a rejoint la partie", PlayerName(ev->a));
         KillfeedPush(line);
         break;
     case EV_PLAYER_LEAVE:
         KillfeedPush("un joueur est parti");
+        break;
+    case EV_LOADOUT:
+        snprintf(weapon_msg, sizeof(weapon_msg), ev->value
+                 ? "Équipement appliqué" : "Équipement prêt pour la prochaine manche");
+        weapon_msg_t = 3.0f;
         break;
     default:
         break;
@@ -360,24 +538,54 @@ static void NetReceive(void)
         last_server_msg = GetTime();
 
         if (buf[0] == PKT_SV_SNAPSHOT && n >= (sock_ssize_t)sizeof(PacketSnapshot)) {
+            const PacketSnapshot *in = (const PacketSnapshot *)buf;
+            // Un snapshot plus vieux que le dernier reçu (UDP réordonné) va
+            // dans le tampon d'interpolation mais ne devient pas « le dernier »
+            if (have_offset && (int32_t)(in->tick - snap.tick) <= 0) {
+                SnapPush(in);
+                continue;
+            }
             memcpy(&snap, buf, sizeof(snap));
+            SnapPush(&snap);
 
             // Le serveur fait autorité sur notre vie. Quand son compteur
             // de respawn change (y compris au tout premier spawn), on
             // reprend la position qu'IL a choisie, et on écho le nouveau
-            // compteur dans nos paquets d'état.
+            // compteur dans nos paquets d'entrées.
             SnapshotPlayer *me = &snap.players[my_id];
             if (me->active) {
                 if (me->spawn_count != my_spawn_count) {   // (re)spawn
                     my_spawn_count = me->spawn_count;
-                    my_pos = (V3){me->x, me->y, me->z};
+                    memset(&my_sim, 0, sizeof(my_sim));
+                    my_sim.pos = (V3){me->x, me->y, me->z};
+                    my_sim.on_ground = me->on_ground != 0;
                     my_yaw = me->yaw;
                     my_pitch = me->pitch;
-                    my_vel = (V3){0};
-                    my_vel_y = 0.0f;
+                    pending_head = 0;        // tout ce qui précède est périmé
+                    pending_count = 0;
                     dead_t = 0.0f;
+                    // Nouvel équipement en main, arme principale, rien en cours
+                    my_slot = me->slot;
+                    reload_t = switch_t = bolt_t = 0.0f;
+                } else if (me->alive) {
+                    Reconcile(me);
                 }
                 my_alive = me->alive != 0;
+                // Armes : ce que le serveur nous donne, moins les tirs qu'il
+                // n'a pas encore vus (différence signée : gère le bouclage)
+                for (int k = 0; k < WEAPON_SLOTS; k++) {
+                    my_weapon[k] = me->weapon[k];
+                    my_mag[k] = me->mag[k];
+                    my_reserve[k] = me->reserve[k];
+                }
+                int in_flight = (int16_t)(my_shot_seq - me->last_shot_seq);
+                if (in_flight > 0 && WEAPONS[my_weapon[my_slot]].mag > 0) {
+                    my_mag[my_slot] -= in_flight;
+                    if (my_mag[my_slot] < 0) my_mag[my_slot] = 0;
+                }
+                // Le serveur a fini de recharger avant nous (ou ne l'a jamais
+                // commencé) : on s'aligne
+                if (me->reload_t <= 0.0f && reload_t > 0.0f && reload_t < 0.2f) reload_t = 0.0f;
                 // La vie a baissé depuis le dernier snapshot : voile rouge
                 if (me->health < last_health) damage_flash_timer = 0.25f;
                 last_health = me->health;
@@ -408,7 +616,7 @@ static V3 LookDir(void)
 // Position des yeux (la caméra), au-dessus des pieds
 static V3 EyePos(void)
 {
-    return (V3){my_pos.x, my_pos.y + PLAYER_EYE_HEIGHT, my_pos.z};
+    return (V3){my_sim.pos.x, my_sim.pos.y + PLAYER_EYE_HEIGHT, my_sim.pos.z};
 }
 
 // Dispersion des balles : rayon du cône de tir (~radians). Dépend de :
@@ -419,10 +627,11 @@ static V3 EyePos(void)
 // Le réticule du HUD s'écarte avec cette même valeur.
 static float WeaponSpread(void)
 {
-    float hspeed = sqrtf(my_vel.x * my_vel.x + my_vel.z * my_vel.z);
-    return Lerp(0.022f, 0.002f, ads)
+    const WeaponStats *w = CurWeapon();
+    float hspeed = sqrtf(my_sim.vel.x * my_sim.vel.x + my_sim.vel.z * my_sim.vel.z);
+    return Lerp(w->spread_hip, w->spread_ads, ads)
          + hspeed * 0.003f
-         + (on_ground ? 0.0f : 0.04f)
+         + (my_sim.on_ground ? 0.0f : 0.04f)
          + bloom;
 }
 
@@ -479,23 +688,47 @@ static Vector3 ViewToWorld(Vector3 v)
     };
 }
 
-// Bout du canon en espace vue (le -0.62 correspond au modèle de l'arme)
+// Bout du canon en espace vue (dépend du modèle de l'arme)
 static Vector3 MuzzleView(void)
 {
-    return Vector3Transform((Vector3){0, 0.02f, -0.62f}, WeaponViewMatrix());
+    return Vector3Transform(WeaponMuzzle(my_weapon[my_slot]), WeaponViewMatrix());
 }
 
-// Tire une balle : recul, flash, dispersion, envoi au serveur et traçante.
+// Une traçante (purement visuelle) de notre canon jusqu'au premier
+// obstacle dans la direction dir : mur, ou joueur affiché.
+static void TracerFrom(V3 eye, Vector3 d)
+{
+    V3 dir = {d.x, d.y, d.z};
+    float t = RaycastMap(eye, dir);
+    if (t > CurWeapon()->range) t = CurWeapon()->range;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        SnapshotPlayer *sp = &snap.players[i];
+        if (!sp->active || !sp->alive || i == my_id) continue;
+        float ht;
+        V3 ppos = {display_pos[i].x, display_pos[i].y, display_pos[i].z};
+        if (RayVsBox(eye, dir, PlayerBox(ppos), &ht) && ht > 0 && ht < t) t = ht;
+    }
+    Vector3 to = {eye.x + dir.x * t, eye.y + dir.y * t, eye.z + dir.z * t};
+    TracerAdd(ViewToWorld(MuzzleView()), to);
+}
+
+// Tire un coup avec l'arme en main : recul, flash, dispersion, envoi au
+// serveur et traçante(s). Le serveur décide des dégâts.
 static void Shoot(void)
 {
-    shoot_cooldown = WEAPON_COOLDOWN;
+    const WeaponStats *w = CurWeapon();
+    shoot_cooldown = w->cooldown;
     muzzle_t = 0.05f;              // flash de bouche pendant 50 ms
-    kick = 1.0f;                   // animation de recul de l'arme
+    kick = (w->pellets > 1 || w->mode == FIRE_BOLT) ? 1.6f : 1.0f;   // recul visuel, plus fort sur les grosses armes
     // Le canon monte (moins en visant) et dévie un peu au hasard. Il
     // redescend tout seul (décroissance dans UpdateViewEffects).
-    recoil_pitch += Randf(0.010f, 0.016f) * (1.0f - ads * 0.35f);
-    recoil_yaw += Randf(-0.006f, 0.006f);
-    bloom = fminf(bloom + 0.006f, 0.04f);   // rafale = moins précis (plafonné)
+    recoil_pitch += Randf(w->recoil * 0.8f, w->recoil * 1.2f) * (1.0f - ads * 0.35f);
+    recoil_yaw += Randf(-w->recoil * 0.5f, w->recoil * 0.5f);
+    bloom = fminf(bloom + w->recoil * 0.6f, 0.04f);   // rafale = moins précis (plafonné)
+    if (w->mag > 0 && my_mag[my_slot] > 0) my_mag[my_slot]--;   // en attendant le snapshot
+    if (w->mode == FIRE_BOLT || w->mode == FIRE_PUMP) bolt_t = 1.0f;   // réarmement animé
+    else if (w->mode == FIRE_SEMI) bolt_t = 0.6f;                      // glissière du pistolet
+    SoundPlay(SoundForWeapon(my_weapon[my_slot]), 1.0f, 0.96f + Randf(0, 0.08f));
 
     // Direction du tir = regard (recul compris) + dispersion aléatoire dans
     // un cône : on décale la direction dans le plan perpendiculaire (r, u).
@@ -512,21 +745,51 @@ static void Shoot(void)
     });
 
     V3 eye = EyePos();
-    V3 dir = {d.x, d.y, d.z};
-    NetSendShoot(eye, dir);        // le serveur décide des dégâts
+    NetSendShoot(eye, (V3){d.x, d.y, d.z});
 
-    // Traçante locale (purement visuelle) : du canon visible jusqu'au
-    // premier obstacle (mur ou joueur affiché).
-    float t = RaycastMap(eye, dir);
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        SnapshotPlayer *sp = &snap.players[i];
-        if (!sp->active || !sp->alive || i == my_id) continue;
-        float ht;
-        V3 ppos = {display_pos[i].x, display_pos[i].y, display_pos[i].z};
-        if (RayVsBox(eye, dir, PlayerBox(ppos), &ht) && ht > 0 && ht < t) t = ht;
+    // Traçantes : une par balle, ou une gerbe pour le fusil à pompe (le
+    // serveur tire ses propres plombs : la gerbe affichée est indicative)
+    if (w->pellets <= 1) {
+        TracerFrom(eye, d);
+    } else {
+        for (int i = 0; i < w->pellets; i++) {
+            float a = Randf(-0.035f, 0.035f), b = Randf(-0.035f, 0.035f);
+            Vector3 pd = Vector3Normalize((Vector3){
+                d.x + r.x * a + u.x * b, d.y + r.y * a + u.y * b, d.z + r.z * a + u.z * b});
+            TracerFrom(eye, pd);
+        }
     }
-    Vector3 to = {eye.x + dir.x * t, eye.y + dir.y * t, eye.z + dir.z * t};
-    TracerAdd(ViewToWorld(MuzzleView()), to);
+}
+
+// Changement d'arme : local tout de suite (animation, arme affichée), et
+// le serveur suit. Pendant WEAPON_SWITCH_TIME on ne peut pas tirer.
+static void SwitchWeapon(int slot)
+{
+    if (slot == my_slot || slot < 0 || slot >= WEAPON_SLOTS || switch_t > 0.0f) return;
+    my_slot = slot;
+    switch_t = WEAPON_SWITCH_TIME + 0.05f;    // un peu plus que le serveur : il refuserait un tir trop tôt
+    reload_t = 0.0f;
+    bolt_t = 0.0f;
+    NetSendWeapon(WA_SWITCH, slot, 0);
+    SoundPlay(SND_SWITCH, 0.7f, 1.0f);
+}
+
+static void StartReload(void)
+{
+    const WeaponStats *w = CurWeapon();
+    if (reload_t > 0.0f || switch_t > 0.0f || w->mag == 0) return;
+    if (my_mag[my_slot] >= w->mag || my_reserve[my_slot] <= 0) return;
+    reload_total = w->reload;
+    reload_t = w->reload + 0.05f;
+    NetSendWeapon(WA_RELOAD, 0, 0);
+    SoundPlay(SND_RELOAD, 0.8f, 1.0f);
+}
+
+// Envoie l'équipement choisi dans les options ; le serveur dira s'il
+// s'applique tout de suite ou à la prochaine manche (EV_LOADOUT).
+static void SendLoadout(void)
+{
+    NetSendWeapon(WA_LOADOUT, options.primary, options.secondary);
 }
 
 //----------------------------------------------------------------------------------
@@ -547,12 +810,20 @@ static void UpdateLocalPlayer(float dt)
     // On ne la lit donc que sur PC : sur mobile, visee et boutons viennent
     // uniquement de touch.c.
 #if !MOBILE_UI
-    float sens = MOUSE_SENSITIVITY * (1.0f - ads * 0.35f);
+    float sens = MOUSE_SENSITIVITY * options.sensitivity * (1.0f - ads * 0.35f) * (scoped ? 0.4f : 1.0f);
     Vector2 md = GetMouseDelta();
     in.look.x = -md.x * sens;
     in.look.y = -md.y * sens;
     in.fire = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    in.fire_pressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     in.aim  = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+    in.reload = IsKeyPressed(KEY_R);
+    in.use = IsKeyDown(KEY_E);          // poser / désamorcer la bombe (maintenu)
+    // Changement d'arme : molette, ou 1 / 2 (positions des touches)
+    float wheel = GetMouseWheelMove();
+    if (wheel != 0.0f) in.swap = true;
+    if (IsKeyPressed(KEY_ONE)) SwitchWeapon(SLOT_PRIMARY);
+    if (IsKeyPressed(KEY_TWO)) SwitchWeapon(SLOT_SECONDARY);
 #endif
 
     // --- Clavier : direction voulue. KEY_* correspond à la POSITION des
@@ -568,6 +839,9 @@ static void UpdateLocalPlayer(float dt)
 
     // --- Doigts : s'ajoutent aux commandes ci-dessus (sans effet sur PC) ---
     TouchApply(&in, ads);
+    if (in.swap) SwitchWeapon(my_slot == SLOT_PRIMARY ? SLOT_SECONDARY : SLOT_PRIMARY);
+    if (in.reload) StartReload();
+    if (options.invert_y) in.look.y = -in.look.y;
 
     // En diagonale la longueur vaudrait ~1.41 : on la ramène à 1 pour ne
     // pas se déplacer plus vite en biais.
@@ -584,41 +858,63 @@ static void UpdateLocalPlayer(float dt)
     // Sprint : en avançant, incompatible avec viser/tirer
     sprinting = in.sprint && move.y > 0.3f && !aiming && !firing;
 
-    // --- Déplacement : vitesse voulue puis accélération progressive.
-    // "devant" et "droite" sont calculés à plat (sans le pitch) : on se
-    // déplace au sol même en regardant en l'air. ---
-    V3 fwd = {sinf(my_yaw), 0, cosf(my_yaw)};
-    V3 right = {fwd.z, 0, -fwd.x};
-    float speed = (sprinting ? SPRINT_SPEED : PLAYER_SPEED)
-                * (1.0f - ads * 0.4f);   // -40 % en visant
-    V3 wish = {
-        (fwd.x * move.y + right.x * move.x) * speed, 0,
-        (fwd.z * move.y + right.z * move.x) * speed,
-    };
-    // La vitesse actuelle se rapproche de la vitesse voulue d'une fraction
-    // (dt * accel) par frame : démarrage et freinage en douceur, et faible
-    // contrôle en l'air (on garde son élan pendant un saut).
-    float accel = on_ground ? ACCEL_GROUND : ACCEL_AIR;
-    my_vel.x += (wish.x - my_vel.x) * fminf(1.0f, dt * accel);
-    my_vel.z += (wish.z - my_vel.z) * fminf(1.0f, dt * accel);
-
-    // Saut : seulement au sol
-    if (in.jump && on_ground) my_vel_y = PLAYER_JUMP_SPEED;
-
-    // Collisions et gravité (code partagé avec le serveur/bot)
-    MovePlayer(&my_pos, my_vel, &my_vel_y, dt, &on_ground);
+    // --- Déplacement : UNE entrée pour cette image, simulée tout de suite
+    // (prédiction) et gardée jusqu'à l'acquittement du serveur. Le
+    // déplacement est quantifié sur un octet AVANT de simuler : le serveur
+    // rejouera exactement la même valeur. ---
+    InputEntry e;
+    memset(&e, 0, sizeof(e));
+    e.seq = ++my_seq;
+    e.dt = (dt > INPUT_MAX_DT) ? INPUT_MAX_DT : dt;
+    e.move_x = (int8_t)lroundf(move.x * 127.0f);
+    e.move_y = (int8_t)lroundf(move.y * 127.0f);
+    e.flags = (uint8_t)((in.jump ? INPUT_JUMP : 0)
+                      | (sprinting ? INPUT_SPRINT : 0)
+                      | ((aiming && !sprinting) ? INPUT_ADS : 0)
+                      | (in.use ? INPUT_USE : 0));
+    e.yaw = my_yaw;
+    e.pitch = my_pitch;
+    PlayerCmd cmd = CmdFromEntry(&e);
+    cmd.speed_mult = CurWeapon()->move_mult;   // comme le serveur : l'arme pèse
+    PlayerStep(&my_sim, &cmd, e.dt);      // collisions et gravité : code partagé
+    PendingPush(&e);
 
     // Phase du balancement de marche : avance avec la vitesse au sol
-    float hspeed = sqrtf(my_vel.x * my_vel.x + my_vel.z * my_vel.z);
-    if (on_ground) bob += dt * hspeed * 1.6f;
+    float hspeed = sqrtf(my_sim.vel.x * my_sim.vel.x + my_sim.vel.z * my_sim.vel.z);
+    if (my_sim.on_ground) bob += dt * hspeed * 1.6f;
+    // Un pas par demi-période du balancement ; réception après une chute
+    int step_no = (int)floorf(bob / PI);
+    if (step_no != last_step && my_sim.on_ground && hspeed > 1.5f) {
+        last_step = step_no;
+        SoundPlay(SND_STEP, 0.35f + 0.25f * (hspeed / SPRINT_SPEED), 0.9f + Randf(0, 0.2f));
+    }
+    if (my_sim.on_ground && !was_on_ground && last_vel_y < -3.0f) SoundPlay(SND_LAND, 0.6f, 1.0f);
+    was_on_ground = my_sim.on_ground;
+    last_vel_y = my_sim.vel_y;
 
-    // --- Tir : automatique tant que le bouton est maintenu, à la cadence
-    // WEAPON_COOLDOWN, et jamais pendant un sprint ---
+    // --- Tir : selon le mode de l'arme (automatique tant que le bouton est
+    // maintenu, ou un coup par pression), à sa cadence, jamais pendant un
+    // sprint, un rechargement ou un changement d'arme, et chargeur non vide ---
+    const WeaponStats *w = CurWeapon();
     if (shoot_cooldown > 0.0f) shoot_cooldown -= dt;
-    if (firing && !sprinting && shoot_cooldown <= 0.0f) Shoot();
+    bool trigger = (w->mode == FIRE_AUTO) ? firing : (firing && !fire_was_down) || in.fire_pressed;
+    fire_was_down = firing;
+    bool can_fire = !sprinting && shoot_cooldown <= 0.0f && reload_t <= 0.0f && switch_t <= 0.0f;
+    if (trigger && can_fire) {
+        if (w->mag == 0 || my_mag[my_slot] > 0) Shoot();
+        else {
+            SoundPlay(SND_EMPTY, 0.6f, 1.0f);
+            if (options.auto_reload) StartReload();
+        }
+    }
+    // Chargeur vide et plus personne n'appuie : on recharge aussi
+    if (options.auto_reload && w->mag > 0 && my_mag[my_slot] == 0 && my_reserve[my_slot] > 0
+        && reload_t <= 0.0f && switch_t <= 0.0f && shoot_cooldown <= 0.0f)
+        StartReload();
 
     // --- Transitions douces de la visée et du sprint (0 -> 1) ---
     ads += ((aiming && !sprinting ? 1.0f : 0.0f) - ads) * fminf(1.0f, dt * 14.0f);
+    scoped = WeaponHasScope(my_weapon[my_slot]) && ads > 0.9f;
     sprint_t += ((sprinting ? 1.0f : 0.0f) - sprint_t) * fminf(1.0f, dt * 10.0f);
 
     // --- Sway : l'arme traîne légèrement derrière la souris ---
@@ -633,6 +929,28 @@ static void UpdateLocalPlayer(float dt)
 static void UpdateViewEffects(float dt)
 {
     kick = fmaxf(0, kick - dt * 12.0f);
+    if (reload_t > 0.0f) {
+        reload_t -= dt;
+        if (reload_t <= 0.0f) SoundPlay(SND_SWITCH, 0.7f, 1.1f);   // chargeur rentré, arme armée
+    }
+    if (explosion_t > 0.0f) explosion_t = fmaxf(0, explosion_t - dt * 0.8f);
+    // La bombe posée bipe, de plus en plus vite
+    if (snap.bomb_state == BOMB_PLANTED) {
+        beep_t -= dt;
+        if (beep_t <= 0.0f) {
+            float t = snap.bomb_timer / BOMB_TIMER;
+            beep_t = 0.12f + 0.9f * t * t;
+            SoundPlayAt(SND_BEEP, (Vector3){snap.bomb_x, snap.bomb_y + 0.2f, snap.bomb_z}, 0.9f, 60.0f);
+        }
+    }
+    // Un tic toutes les demi-secondes pendant qu'ON pose ou désamorce
+    if (snap.bomb_actor == my_id && my_id >= 0) {
+        use_tick_t -= dt;
+        if (use_tick_t <= 0.0f) { use_tick_t = 0.5f; SoundPlay(SND_BEEP, 0.4f, 0.7f); }
+    } else use_tick_t = 0.0f;
+    if (switch_t > 0.0f) switch_t -= dt;
+    if (bolt_t > 0.0f) bolt_t = fmaxf(0, bolt_t - dt * 2.2f);
+    if (weapon_msg_t > 0.0f) weapon_msg_t -= dt;
     recoil_pitch -= recoil_pitch * fminf(1.0f, dt * 6.0f);
     recoil_yaw -= recoil_yaw * fminf(1.0f, dt * 6.0f);
     bloom = fmaxf(0, bloom - dt * 0.08f);
@@ -661,7 +979,7 @@ static void UpdateLookTargets(void)
 
         Vector3 self = display_pos[i];
         if (!sp->alive) {   // mort : plus de regard
-            CharAnimLookAt(&anim[i], self, sp->yaw, self, false);
+            CharAnimLookAt(&anim[i], self, display_yaw[i], self, false);
             continue;
         }
 
@@ -671,11 +989,11 @@ static void UpdateLookTargets(void)
 
         // Nous d'abord : notre position n'est pas dans display_pos
         if (my_alive && my_id >= 0 && snap.players[my_id].team != sp->team) {
-            float dx = my_pos.x - self.x, dz = my_pos.z - self.z;
+            float dx = my_sim.pos.x - self.x, dz = my_sim.pos.z - self.z;
             float d2 = dx * dx + dz * dz;
             if (d2 < best_d2) {
                 best_d2 = d2;
-                best = (Vector3){my_pos.x, my_pos.y, my_pos.z};
+                best = (Vector3){my_sim.pos.x, my_sim.pos.y, my_sim.pos.z};
                 found = true;
             }
         }
@@ -687,19 +1005,95 @@ static void UpdateLookTargets(void)
             float d2 = dx * dx + dz * dz;
             if (d2 < best_d2) { best_d2 = d2; best = display_pos[j]; found = true; }
         }
-        CharAnimLookAt(&anim[i], self, sp->yaw, best, found);
+        CharAnimLookAt(&anim[i], self, display_yaw[i], best, found);
     }
 }
 
-// Les autres joueurs glissent vers leur dernière position reçue : les
-// snapshots n'arrivent que 20 fois/s, sans lissage ils "téléporteraient".
+// Range un snapshot dans l'anneau et affine l'horloge serveur estimée.
+static void SnapPush(const PacketSnapshot *sp)
+{
+    SnapEntry *e = &snapbuf[sp->tick % SNAP_BUF];
+    e->snap = *sp;
+    e->valid = true;
+    // temps serveur du snapshot - instant de réception : l'écart entre nos
+    // deux horloges, lissé (il contient la gigue), repris d'un coup s'il
+    // décroche (pause, reconnexion)
+    double off = (double)sp->tick / SERVER_TICK_HZ - GetTime();
+    if (!have_offset || fabs(off - server_offset) > 0.5) { server_offset = off; have_offset = true; }
+    else server_offset += (off - server_offset) * 0.05;
+}
+
+// Réconciliation : le serveur nous dit où il nous a mis après notre entrée
+// last_seq. On repart de là et on rejoue nos entrées plus récentes. Si nos
+// prédictions étaient justes (presque toujours), on retombe au même
+// endroit ; sinon la correction du serveur s'applique, et il a raison.
+static void Reconcile(const SnapshotPlayer *me)
+{
+    PendingAck(me->last_seq);
+    PlayerSim s;
+    memset(&s, 0, sizeof(s));
+    s.pos = (V3){me->x, me->y, me->z};
+    s.vel = (V3){me->vx, 0, me->vz};
+    s.vel_y = me->vy;
+    s.on_ground = me->on_ground != 0;
+    for (int i = 0; i < pending_count; i++) {
+        InputEntry e = PendingAt(i);
+        PlayerCmd c = CmdFromEntry(&e);
+        PlayerStep(&s, &c, e.dt);
+    }
+    my_sim = s;
+}
+
+// Interpolation d'un angle par le chemin le plus court
+static float LerpAngle(float a, float b, float t)
+{
+    float d = b - a;
+    while (d >  PI) d -= 2.0f * PI;
+    while (d < -PI) d += 2.0f * PI;
+    return a + d * t;
+}
+
+// Les autres joueurs sont affichés INTERP_DELAY dans le passé, entre les
+// deux snapshots qui encadrent cet instant (voir SnapEntry). S'il manque
+// le snapshot suivant (à-coup réseau), on reste sur le dernier connu : on
+// n'extrapole jamais.
 static void InterpolateOthers(float dt)
 {
-    float k = 1.0f - expf(-INTERP_SPEED * dt);  // fraction du chemin restant
+    if (!have_offset) return;
+    double render = GetTime() + server_offset - INTERP_DELAY;
+    view_time = (float)render;
+
+    const SnapEntry *a = NULL, *b = NULL;    // a : le plus récent <= render ; b : le plus ancien > render
+    double ta = 0, tb = 0;
+    for (int i = 0; i < SNAP_BUF; i++) {
+        if (!snapbuf[i].valid) continue;
+        double t = (double)snapbuf[i].snap.tick / SERVER_TICK_HZ;
+        if (t <= render && (!a || t > ta)) { a = &snapbuf[i]; ta = t; }
+        if (t >  render && (!b || t < tb)) { b = &snapbuf[i]; tb = t; }
+    }
+    if (!a && !b) return;
+    if (!a) { a = b; ta = tb; }
+    if (!b) { b = a; tb = ta; }
+    float alpha = (tb > ta) ? (float)((render - ta) / (tb - ta)) : 0.0f;
+
     for (int i = 0; i < MAX_PLAYERS; i++) {
-        SnapshotPlayer *sp = &snap.players[i];
+        SnapshotPlayer *sp = &snap.players[i];          // drapeaux : le dernier snapshot
         if (!sp->active || i == my_id) { has_display[i] = false; continue; }
-        Vector3 target = {sp->x, sp->y, sp->z};
+        const SnapshotPlayer *pa = &a->snap.players[i], *pb = &b->snap.players[i];
+        if (!pa->active) pa = pb;
+        if (!pb->active) pb = pa;
+
+        Vector3 target;
+        float yaw;
+        if (!pa->active) { target = (Vector3){sp->x, sp->y, sp->z}; yaw = sp->yaw; }
+        else if (pa->spawn_count != pb->spawn_count) {
+            // Respawn entre les deux : pas d'interpolation à travers l'arène
+            target = (Vector3){pb->x, pb->y, pb->z}; yaw = pb->yaw;
+        } else {
+            target = Vector3Lerp((Vector3){pa->x, pa->y, pa->z}, (Vector3){pb->x, pb->y, pb->z}, alpha);
+            yaw = LerpAngle(pa->yaw, pb->yaw, alpha);
+        }
+
         Vector3 before = display_pos[i];
         if (!has_display[i]) {
             display_pos[i] = target;   // première apparition : direct
@@ -710,13 +1104,26 @@ static void InterpolateOthers(float dt)
             before = target;
             CharAnimTeleport(&anim[i]);   // et son cadavre ne se relève pas
         } else {
-            display_pos[i] = Vector3Lerp(display_pos[i], target, k);
+            display_pos[i] = target;
         }
+        display_yaw[i] = yaw;
 
         // Toute l'animation se déduit du déplacement affiché cette image
         // (allure, foulée, saut, atterrissage) et de l'état vivant/mort :
         // le client n'a aucune donnée d'animation à recevoir du serveur.
         CharAnimUpdate(&anim[i], dt, before, display_pos[i], sp->alive != 0);
+
+        // Ses pas (une fois par demi-période de sa foulée), et les
+        // piaillements d'un poussin zombie qui rôde
+        if (sp->alive) {
+            int step_no = (int)floorf(anim[i].phase / PI);
+            if (step_no != other_step[i]) {
+                other_step[i] = step_no;
+                if (anim[i].move > 0.3f) SoundPlayAt(SND_STEP, display_pos[i], 0.5f, 25.0f);
+            }
+            if (sp->is_bot == BOT_ZOMBIE && Randf(0, 1) < dt * 0.12f)
+                SoundPlayAt(SND_CHIRP, (Vector3){display_pos[i].x, display_pos[i].y + 1.3f, display_pos[i].z}, 0.7f, 35.0f);
+        }
     }
 
     UpdateLookTargets();   // et chacun tourne la tête vers sa proie
@@ -733,7 +1140,7 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
         // la tête penchée sur le côté.
         dead_t += dt;
         float k = fminf(dead_t * 2.0f, 1.0f);
-        cam->position = (Vector3){eye.x, Lerp(eye.y, my_pos.y + 0.35f, k), eye.z};
+        cam->position = (Vector3){eye.x, Lerp(eye.y, my_sim.pos.y + 0.35f, k), eye.z};
         cam->target = (Vector3){eye.x + sinf(my_yaw), cam->position.y - 0.3f,
                                 eye.z + cosf(my_yaw)};
         cam->up = Vector3Normalize((Vector3){cosf(my_yaw) * 0.6f, 1.0f, 0});
@@ -745,8 +1152,8 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
     // Head bob : rebond vertical proportionnel à la vitesse, presque
     // supprimé en visée pour garder la mire stable
     float eye_y = eye.y;
-    if (on_ground) {
-        float hspeed = sqrtf(my_vel.x * my_vel.x + my_vel.z * my_vel.z);
+    if (my_sim.on_ground) {
+        float hspeed = sqrtf(my_sim.vel.x * my_sim.vel.x + my_sim.vel.z * my_sim.vel.z);
         eye_y += sinf(bob * 2.0f) * 0.03f
                * fminf(hspeed / PLAYER_SPEED, 1.4f) * (1.0f - ads * 0.8f);
     }
@@ -758,7 +1165,7 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
     cam->projection = CAMERA_PERSPECTIVE;
 
     // FOV cible selon la situation, rejoint en douceur
-    float fov = Lerp(FOV_HIP, FOV_ADS, ads);
+    float fov = Lerp(FOV_HIP, WeaponHasScope(my_weapon[my_slot]) ? FOV_SCOPE : FOV_ADS, ads);
     fov = Lerp(fov, FOV_SPRINT, sprint_t);
     *fov_current += (fov - *fov_current) * fminf(1.0f, dt * 14.0f);
     cam->fovy = *fov_current;
@@ -767,29 +1174,127 @@ static void UpdatePlayerCamera(Camera3D *cam, float dt, float *fov_current)
 //----------------------------------------------------------------------------------
 // Rendu : map, joueurs, arme, HUD
 //----------------------------------------------------------------------------------
+// Une boîte de la map, selon son genre (voir BoxKind dans game.h)
+static void DrawMapBox(const Box *b)
+{
+    static const Color KIND_COLORS[K_COUNT] = {
+        [K_WALL]    = {212, 190, 142, 255},   // pisé sable
+        [K_CRATE]   = {156, 118,  72, 255},   // bois clair
+        [K_BARREL]  = { 86,  96,  78, 255},   // tôle vert-de-gris
+        [K_SANDBAG] = {150, 140, 100, 255},   // toile kaki
+        [K_ROOF]    = {150, 140, 125, 255},   // dalle
+        [K_STEP]    = {196, 172, 128, 255},   // pierre claire
+        [K_WOOD]    = { 96,  62,  34, 255},   // bois sombre
+        [K_STONE]   = {160, 152, 138, 255},   // pierre grise
+        [K_METAL]   = { 80,  82,  88, 255},   // ferraille
+        [K_AWNING]  = {196,  70,  58, 255},   // toile rouge
+        [K_CLOTH]   = {110,  60,  50, 255},   // tapis bordeaux
+    };
+    // Matériau (texture) et teinte par genre : la texture donne la matière,
+    // la teinte la nuance (un battant de porte est du bois sombre, une
+    // caisse du bois clair ; un tonneau est de la tôle verdie)
+    static const int KIND_MATS[K_COUNT] = {
+        [K_WALL] = MAT_WALL, [K_CRATE] = MAT_WOOD, [K_BARREL] = MAT_METAL,
+        [K_SANDBAG] = MAT_CLOTH, [K_ROOF] = MAT_ROOF, [K_STEP] = MAT_STONE,
+        [K_WOOD] = MAT_WOOD, [K_STONE] = MAT_STONE, [K_METAL] = MAT_METAL,
+        [K_AWNING] = MAT_CLOTH, [K_CLOTH] = MAT_CLOTH,
+    };
+    static const Color KIND_TINTS[K_COUNT] = {
+        [K_WALL]    = {255, 250, 240, 255},
+        [K_CRATE]   = {255, 240, 215, 255},
+        [K_BARREL]  = {150, 175, 140, 255},
+        [K_SANDBAG] = {205, 195, 150, 255},
+        [K_ROOF]    = {255, 250, 245, 255},
+        [K_STEP]    = {240, 225, 200, 255},
+        [K_WOOD]    = {135,  95,  60, 255},
+        [K_STONE]   = {255, 252, 245, 255},
+        [K_METAL]   = {200, 205, 215, 255},
+        [K_AWNING]  = {235,  95,  75, 255},
+        [K_CLOTH]   = {165,  85,  70, 255},
+    };
+    (void)KIND_COLORS;
+    Vector3 center = {(b->min.x + b->max.x) / 2, (b->min.y + b->max.y) / 2,
+                      (b->min.z + b->max.z) / 2};
+    Vector3 size = {b->max.x - b->min.x, b->max.y - b->min.y, b->max.z - b->min.z};
+    int kind = (b->kind >= 0 && b->kind < K_COUNT) ? b->kind : K_WALL;
+    Color c = KIND_TINTS[kind];
+    BatchSetMaterial(KIND_MATS[kind]);
+    switch (kind) {
+    case K_BARREL:
+    case K_STONE:
+        if (size.y > 0.3f && fabsf(size.x - size.z) < 0.05f) {
+            // Cylindre vertical : tonneau, colonne, avec ses cerclages
+            float r = size.x / 2;
+            Seg(MatrixIdentity(), (Vector3){center.x, b->min.y, center.z},
+                (Vector3){center.x, b->max.y, center.z}, r, c);
+            if (kind == K_BARREL) {
+                Color hoop = Shade(c, 0.6f);
+                for (int k = 0; k < 2; k++) {
+                    float y = b->min.y + size.y * (0.25f + 0.5f * k);
+                    Seg(MatrixIdentity(), (Vector3){center.x, y - 0.03f, center.z},
+                        (Vector3){center.x, y + 0.03f, center.z}, r * 1.04f, hoop);
+                }
+            }
+            return;
+        }
+        break;
+    case K_SANDBAG: {
+        // Des sacs : une rangée d'ellipsoïdes qui se chevauchent, sur deux lits
+        Color c2 = Shade(c, 0.88f);
+        float along = (size.x >= size.z) ? size.x : size.z;
+        int n = (int)(along / 0.9f) + 1;
+        for (int lit = 0; lit < 2; lit++) {
+            float y = b->min.y + size.y * (lit ? 0.72f : 0.27f);
+            for (int k = 0; k < n; k++) {
+                float t = (n > 1) ? (float)k / (n - 1) : 0.5f;
+                float off = lit ? (0.45f / along) : 0.0f;
+                t = t * (1.0f - 2 * off) + off;
+                Vector3 p = (size.x >= size.z)
+                    ? (Vector3){b->min.x + size.x * t, y, center.z}
+                    : (Vector3){center.x, y, b->min.z + size.z * t};
+                Ball(MatrixIdentity(), p,
+                     (Vector3){(size.x >= size.z) ? 0.55f : size.x / 2,
+                               size.y * 0.3f, (size.x >= size.z) ? size.z / 2 : 0.55f},
+                     (k + lit) % 2 ? c : c2);
+            }
+        }
+        return;
+    }
+    default:
+        break;
+    }
+    Box3(MatrixIdentity(), center, (Vector3){0, 0, 0}, size, c);
+    // Contours : seulement sur les gros volumes (les petits décors en
+    // auraient trop, pour rien)
+    if (size.x * size.y * size.z > 0.5f)
+        DrawCubeWiresV(center, size, (Color){110, 90, 60, 90});
+}
+
 static void DrawMap(void)
 {
-    // Sol de l'arène
-    DrawPlane((Vector3){0, 0, 0},
-              (Vector2){ARENA_HALF * 2, ARENA_HALF * 2},
-              (Color){60, 65, 70, 255});
-    // Quadrillage léger tous les 5 m (donne une échelle visuelle)
-    for (int i = -(int)ARENA_HALF; i <= (int)ARENA_HALF; i += 5) {
+    // Sol de l'arène : une dalle de sable texturée (sa face du dessus est
+    // au niveau 0 ; le reste est sous terre)
+    BatchSetMaterial(MAT_SAND);
+    Box3(MatrixIdentity(), (Vector3){0, -0.5f, 0}, (Vector3){0, 0, 0},
+         (Vector3){ARENA_HALF * 2 + 2, 1.0f, ARENA_HALF * 2 + 2}, WHITE);
+    BatchSetMaterial(MAT_FLAT);
+    // Quadrillage léger tous les 10 m (donne une échelle visuelle)
+    for (int i = -(int)ARENA_HALF; i <= (int)ARENA_HALF; i += 10) {
         DrawLine3D((Vector3){(float)i, 0.01f, -ARENA_HALF},
-                   (Vector3){(float)i, 0.01f, ARENA_HALF}, (Color){80, 85, 90, 255});
+                   (Vector3){(float)i, 0.01f, ARENA_HALF}, (Color){170, 146, 100, 255});
         DrawLine3D((Vector3){-ARENA_HALF, 0.01f, (float)i},
-                   (Vector3){ARENA_HALF, 0.01f, (float)i}, (Color){80, 85, 90, 255});
+                   (Vector3){ARENA_HALF, 0.01f, (float)i}, (Color){170, 146, 100, 255});
     }
-    // Les boîtes de la map (les mêmes AABB que celles des collisions :
-    // ce qu'on voit est exactement ce qui bloque)
-    for (int i = 0; i < MAP_BOX_COUNT; i++) {
-        Box b = MAP_BOXES[i];
-        Vector3 center = {(b.min.x + b.max.x) / 2, (b.min.y + b.max.y) / 2,
-                          (b.min.z + b.max.z) / 2};
-        Vector3 size = {b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z};
-        DrawCubeV(center, size, (Color){110, 115, 125, 255});
-        DrawCubeWiresV(center, size, (Color){40, 42, 48, 255});
-    }
+    // Les boîtes de la map (les mêmes AABB que celles des collisions : ce
+    // qu'on voit est exactement ce qui bloque), puis le décor (qui ne
+    // bloque rien). Tout passe par le lot (Box3, Seg, Ball) : un seul
+    // appel de dessin avec les personnages, et l'ombrage cuit par face
+    // donne du relief. Le genre de chaque boîte (BoxKind) choisit la
+    // couleur et la forme : un tonneau ou une colonne est un cylindre, un
+    // tas de sacs de sable un ellipsoïde.
+    for (int i = 0; i < MAP_BOX_COUNT + MAP_DECOR_COUNT; i++)
+        DrawMapBox(i < MAP_BOX_COUNT ? &MAP_BOXES[i] : &MAP_DECOR[i - MAP_BOX_COUNT]);
+    BatchSetMaterial(MAT_FLAT);   // l'enseigne et les personnages : couleur seule
     // Enseigne reprise du premier jeu : un poussin géant tourne au bout d'un
     // mât planté sur le bloc central, repère visible de toute l'arène.
     // Matrice : échelle x6, rotation autour de Y, puis montée en haut du mât.
@@ -803,9 +1308,9 @@ static void DrawMap(void)
                              MatrixTranslate(0, 5.0f, 0)), t, 0.2f);
 
     // Marquage au sol des zones de spawn de chaque équipe
-    DrawCircle3D((Vector3){0, 0.02f, -26}, 4, (Vector3){1, 0, 0}, 90,
+    DrawCircle3D((Vector3){0, 0.02f, -51}, 8, (Vector3){1, 0, 0}, 90,
                  Fade(TeamColor(TEAM_RED), 0.4f));
-    DrawCircle3D((Vector3){0, 0.02f, 26}, 4, (Vector3){1, 0, 0}, 90,
+    DrawCircle3D((Vector3){0, 0.02f, 51}, 8, (Vector3){1, 0, 0}, 90,
                  Fade(TeamColor(TEAM_BLUE), 0.4f));
 }
 
@@ -825,8 +1330,10 @@ static void DrawPlayers(void)
         Vector3 p = display_pos[i];
         Color col = TeamColor(sp->team);
 
-        if (sp->is_bot) DrawZombieChick(p, sp->yaw, &anim[i], col);
-        else            DrawSoldier(p, sp->yaw, &anim[i], col);
+        bool carries = (snap.bomb_state == BOMB_CARRIED && snap.bomb_carrier == i);
+        if (sp->is_bot == BOT_ZOMBIE) DrawZombieChick(p, display_yaw[i], &anim[i], col);
+        else DrawSoldier(p, display_yaw[i], &anim[i], col,
+                         sp->weapon[sp->slot < WEAPON_SLOTS ? sp->slot : 0], carries);
 
         // Ombre "pastille" du premier jeu : elle se resserre quand il saute
         // et s'étale quand il est couché.
@@ -837,66 +1344,37 @@ static void DrawPlayers(void)
         if (tracers[i].active)
             DrawLine3D(tracers[i].from, tracers[i].to, (Color){255, 230, 120, 255});
     }
-}
 
-// Modèle du fusil, décrit dans le repère de l'ARME : origine au boîtier,
-// canon vers -Z, +Y vers le haut. Construit avec des formes simples.
-// Dessiné via la pile de matrices rlgl : les DrawCube* sont transformés
-// par la matrice courante (posée par DrawViewModel).
-static void DrawRifleModel(void)
-{
-    const Color METAL = {38, 38, 36, 255};     // acier sombre
-    const Color METAL2 = {55, 54, 50, 255};    // acier plus clair (contraste)
-    const Color POLYMER = {30, 30, 30, 255};   // plastique (poignée, crosse)
-
-    // Boîtier principal et partie basse
-    DrawCube((Vector3){0, 0, 0}, 0.05f, 0.06f, 0.28f, METAL);
-    DrawCube((Vector3){0, -0.048f, 0.02f}, 0.045f, 0.045f, 0.2f, METAL2);
-    // Poignée pistolet (légèrement inclinée : approximée par une boîte)
-    DrawCube((Vector3){0, -0.1f, 0.09f}, 0.036f, 0.1f, 0.05f, POLYMER);
-    // Garde-main + rail supérieur
-    DrawCube((Vector3){0, 0, -0.28f}, 0.055f, 0.055f, 0.3f, METAL2);
-    DrawCube((Vector3){0, 0.034f, -0.12f}, 0.024f, 0.012f, 0.55f, METAL);
-    // Canon et cache-flamme
-    DrawCylinderEx((Vector3){0, 0, -0.43f}, (Vector3){0, 0, -0.58f},
-                   0.012f, 0.012f, 8, METAL);
-    DrawCylinderEx((Vector3){0, 0, -0.56f}, (Vector3){0, 0, -0.62f},
-                   0.016f, 0.016f, 8, (Color){20, 20, 20, 255});
-    // Crosse
-    DrawCube((Vector3){0, -0.01f, 0.28f}, 0.045f, 0.08f, 0.16f, POLYMER);
-    // Viseur : deux montants + point rouge au centre (aligné avec l'axe
-    // de visée : en ADS il tombe exactement au centre de l'écran)
-    DrawCube((Vector3){0, 0.065f, -0.04f}, 0.012f, 0.03f, 0.012f, POLYMER);
-    DrawCube((Vector3){0, 0.065f, 0.02f}, 0.012f, 0.03f, 0.012f, POLYMER);
-    DrawSphere((Vector3){0, 0.085f, -0.04f}, 0.004f, (Color){255, 40, 40, 255});
-
-    // Chargeur courbé (deux boîtes)
-    DrawCube((Vector3){0, -0.1f, -0.03f}, 0.03f, 0.1f, 0.06f, METAL2);
-    DrawCube((Vector3){0, -0.16f, -0.045f}, 0.032f, 0.05f, 0.06f, METAL2);
-
-    // Flash de bouche : boule + étoile de 4 branches, taille aléatoire à
-    // chaque frame pour un effet vivant
-    if (muzzle_t > 0) {
-        float k = 0.8f + Randf(0, 0.6f);
-        DrawSphere((Vector3){0, 0, -0.66f}, 0.03f * k, (Color){255, 240, 170, 255});
-        DrawCube((Vector3){0, 0, -0.66f}, 0.14f * k, 0.012f, 0.012f,
-                 (Color){255, 180, 60, 255});
-        DrawCube((Vector3){0, 0, -0.66f}, 0.012f, 0.14f * k, 0.012f,
-                 (Color){255, 180, 60, 255});
+    // La bombe au sol : lâchée, ou posée (diode qui clignote de plus en plus vite)
+    if (snap.bomb_state == BOMB_DROPPED || snap.bomb_state == BOMB_PLANTED) {
+        float t = (float)GetTime();
+        float rate = (snap.bomb_state == BOMB_PLANTED) ? 2.0f + 10.0f * (1.0f - snap.bomb_timer / BOMB_TIMER) : 1.5f;
+        float blink = (sinf(t * rate * 2 * PI) > 0.3f) ? 1.0f : 0.1f;
+        DrawBomb(MatrixTranslate(snap.bomb_x, snap.bomb_y, snap.bomb_z), blink, snap.bomb_state == BOMB_PLANTED);
     }
-
-    // Mains gantées : une sur le garde-main, une sur la poignée
-    const Color GLOVE = {40, 38, 34, 255};
-    DrawSphere((Vector3){-0.005f, -0.045f, -0.3f}, 0.035f, GLOVE);
-    DrawSphere((Vector3){0.0f, -0.1f, 0.1f}, 0.035f, GLOVE);
+    // L'explosion : une boule de feu qui gonfle et s'éteint
+    if (explosion_t > 0.0f) {
+        float k = 1.0f - explosion_t;
+        float r = 2.0f + k * BOMB_RADIUS;
+        unsigned char a = (unsigned char)(200 * explosion_t);
+        Ball(MatrixIdentity(), (Vector3){explosion_pos.x, explosion_pos.y + r * 0.4f, explosion_pos.z},
+             (Vector3){r, r * 0.8f, r}, (Color){255, (unsigned char)(120 + 100 * explosion_t), 40, a});
+        Ball(MatrixIdentity(), (Vector3){explosion_pos.x, explosion_pos.y + r * 0.6f, explosion_pos.z},
+             (Vector3){r * 0.6f, r * 0.5f, r * 0.6f}, (Color){255, 240, 180, a});
+    }
 }
 
 // Passe de rendu du "view model" : l'arme est dessinée APRÈS la scène,
 // avec une caméra fixe à l'origine et SANS test de profondeur : elle
 // passe toujours devant le décor et ne rentre jamais dans les murs.
+// Le modèle vient de weapons.c (le même que celui que tiennent les autres
+// soldats) ; ici on l'anime : recul, rechargement (l'arme bascule et le
+// chargeur sort), changement d'arme (elle descend puis remonte),
+// réarmement (verrou, pompe, glissière).
 static void DrawViewModel(void)
 {
     if (!my_alive) return;   // pas d'arme à l'écran quand on est mort
+    if (scoped) return;      // dans la lunette : l'arme n'est plus à l'écran
 
     Camera3D vc = {0};
     vc.position = (Vector3){0, 0, 0};
@@ -907,17 +1385,73 @@ static void DrawViewModel(void)
     vc.fovy = Lerp(55.0f, 45.0f, ads);
     vc.projection = CAMERA_PERSPECTIVE;
 
+    // Animations : rechargement (0 -> 1 -> 0 : elle bascule vers le bas,
+    // le chargeur tombe puis revient), changement (descend hors champ)
+    float rl = (reload_t > 0.0f && reload_total > 0.0f) ? 1.0f - reload_t / (reload_total + 0.05f) : 0.0f;
+    float rl_k = sinf(rl * PI);                 // 0 au début, 1 au milieu, 0 à la fin
+    float sw = (switch_t > 0.0f) ? switch_t / (WEAPON_SWITCH_TIME + 0.05f) : 0.0f;
+    float lower = fmaxf(rl_k * 0.08f, sw * 0.35f);
+    Matrix anim = MatrixMultiply(MatrixRotateXYZ((Vector3){-rl_k * 0.5f - sw * 0.9f, rl_k * 0.25f, -rl_k * 0.3f}),
+                                 MatrixTranslate(rl_k * 0.02f, -lower, rl_k * 0.03f));
+    WeaponPose pose = {0};
+    pose.muzzle = (muzzle_t > 0) ? 0.8f + Randf(0, 0.6f) : 0.0f;
+    pose.mag_out = (rl > 0.15f && rl < 0.85f) ? sinf((rl - 0.15f) / 0.7f * PI) : 0.0f;
+    pose.bolt = sinf(bolt_t * PI);
+
     BeginMode3D(vc);
         rlDisableDepthTest();          // l'arme s'affiche par-dessus tout
-        rlPushMatrix();
-        // On pose le repère de l'arme (rotation + position en espace vue) :
-        // tous les DrawCube de DrawRifleModel se font dedans
-        Matrix m = WeaponViewMatrix();
-        rlMultMatrixf(MatrixToFloat(m));
-        DrawRifleModel();
-        rlPopMatrix();
+        BatchBegin();
+        DrawWeaponModel(MatrixMultiply(anim, WeaponViewMatrix()), my_weapon[my_slot], &pose);
+        BatchEnd();
         rlEnableDepthTest();
     EndMode3D();
+}
+
+// La lunette du FR-F2 : tout l'écran noir sauf un cercle, un réticule fin
+static void DrawScopeOverlay(void)
+{
+    if (!scoped || !my_alive) return;
+    int cx = UIW / 2, cy = UIH / 2;
+    float r = UIH * 0.42f;
+    DrawRing((Vector2){(float)cx, (float)cy}, r, UIH * 1.2f, 0, 360, 64, BLACK);
+    DrawRing((Vector2){(float)cx, (float)cy}, r - 6, r, 0, 360, 64, (Color){30, 30, 30, 255});
+    DrawLine(cx - (int)r, cy, cx + (int)r, cy, Fade(BLACK, 0.9f));
+    DrawLine(cx, cy - (int)r, cx, cy + (int)r, Fade(BLACK, 0.9f));
+    DrawCircle(cx, cy, 2, RED);
+}
+
+// Aperçu 3D d'une arme dans un menu : elle tourne lentement dans un cadre
+// de l'écran. Le cadre a le ratio de l'écran, pour pouvoir simplement
+// restreindre la zone de rendu (rlViewport) sans déformer la projection.
+static void DrawWeaponPreview(void)
+{
+    Rectangle rect;
+    int weapon;
+    if (!MenuWeaponPreview(&rect, &weapon)) return;
+    int sw = GetScreenWidth(), sh = GetScreenHeight();
+    int px = (int)(rect.x * ui_scale), pw = (int)(rect.width * ui_scale);
+    int ph = (int)(rect.height * ui_scale);
+    int py = sh - (int)((rect.y + rect.height) * ui_scale);   // OpenGL : origine en bas
+    if (pw < 8 || ph < 8) return;
+    rlViewport(px, py, pw, ph);
+    Camera3D cam = {0};
+    cam.position = (Vector3){0.0f, 0.35f, 0.9f};
+    cam.target = (Vector3){0, 0, 0};
+    cam.up = (Vector3){0, 1, 0};
+    cam.fovy = 40.0f;
+    cam.projection = CAMERA_PERSPECTIVE;
+    BeginMode3D(cam);
+        rlDisableDepthTest();
+        BatchBegin();
+        // Posée à plat, canon vers la gauche, tournant doucement
+        Matrix m = MatrixMultiply(MatrixRotateY((float)GetTime() * 0.8f), MatrixTranslate(0, 0.02f, 0));
+        Vector3 mz = WeaponMuzzle(weapon);
+        m = MatrixMultiply(MatrixTranslate(0, 0, -mz.z * 0.45f), m);   // centrée sur sa longueur
+        DrawWeaponModel(m, weapon, NULL);
+        BatchEnd();
+        rlEnableDepthTest();
+    EndMode3D();
+    rlViewport(0, 0, sw, sh);
 }
 
 // Pseudos au-dessus des têtes (projection 3D -> écran)
@@ -951,6 +1485,7 @@ static void DrawNameTags(Camera3D cam)
 static void DrawCrosshair(void)
 {
     if (ads > 0.7f) return;        // en visée : le viseur de l'arme suffit
+    if (!my_alive) return;
     Color c = (hit_marker_timer > 0) ? RED : RAYWHITE;
     c = Fade(c, 1.0f - ads);       // s'efface pendant la transition de visée
     int cx = UIW / 2, cy = UIH / 2;
@@ -967,13 +1502,31 @@ static void DrawHUD(void)
     SnapshotPlayer *me = (my_id >= 0) ? &snap.players[my_id] : NULL;
     char buf[64];
 
-    // --- Scores d'équipe en haut au centre ---
+    // --- Manches gagnées, numéro de manche et chrono, en haut au centre ---
     snprintf(buf, sizeof(buf), "%d", snap.score[TEAM_RED]);
-    DrawRectangle(UIW / 2 - 90, 12, 70, 34, Fade(TeamColor(TEAM_RED), 0.8f));
-    DrawText(buf, UIW / 2 - 90 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
+    DrawRectangle(UIW / 2 - 110, 12, 70, 34, Fade(TeamColor(TEAM_RED), 0.8f));
+    DrawText(buf, UIW / 2 - 110 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
     snprintf(buf, sizeof(buf), "%d", snap.score[TEAM_BLUE]);
-    DrawRectangle(UIW / 2 + 20, 12, 70, 34, Fade(TeamColor(TEAM_BLUE), 0.8f));
-    DrawText(buf, UIW / 2 + 20 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
+    DrawRectangle(UIW / 2 + 40, 12, 70, 34, Fade(TeamColor(TEAM_BLUE), 0.8f));
+    DrawText(buf, UIW / 2 + 40 + 35 - MeasureText(buf, 24) / 2, 18, 24, WHITE);
+    {
+        int t = (int)(snap.round_time + 0.999f);
+        if (snap.round_phase == ROUND_PLAY) snprintf(buf, sizeof(buf), "%d:%02d", t / 60, t % 60);
+        else snprintf(buf, sizeof(buf), "--:--");
+        DrawRectangle(UIW / 2 - 36, 12, 72, 34, Fade(BLACK, 0.55f));
+        DrawText(buf, UIW / 2 - MeasureText(buf, 22) / 2, 19, 22, RAYWHITE);
+        snprintf(buf, sizeof(buf), "MANCHE %d", snap.round);
+        DrawText(buf, UIW / 2 - MeasureText(buf, 14) / 2, 50, 14, LIGHTGRAY);
+        // Survivants : un point par membre vivant sous chaque score
+        int ar = 0, ab = 0;
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            SnapshotPlayer *sp = &snap.players[i];
+            if (!sp->active || !sp->alive) continue;
+            if (sp->team == TEAM_RED) ar++; else ab++;
+        }
+        for (int i = 0; i < ar && i < 8; i++) DrawCircle(UIW / 2 - 104 + i * 9, 54, 3, TeamColor(TEAM_RED));
+        for (int i = 0; i < ab && i < 8; i++) DrawCircle(UIW / 2 + 104 - i * 9, 54, 3, TeamColor(TEAM_BLUE));
+    }
 
     // --- Vie et stats perso en bas à gauche ---
     if (me && me->active) {
@@ -986,6 +1539,86 @@ static void DrawHUD(void)
         snprintf(buf, sizeof(buf), "K %d / D %d", me->kills, me->deaths);
         DrawText(buf, 30, UIH - 82, 18, RAYWHITE);
     }
+
+    // --- L'arme et ses munitions, en bas au centre ---
+    if (me && me->active && me->alive) {
+        const WeaponStats *w = CurWeapon();
+        int cx = UIW / 2 + 120;
+        DrawText(w->name, cx - MeasureText(w->name, 18) / 2, UIH - 88, 18, LIGHTGRAY);
+        if (w->mag > 0) {
+            snprintf(buf, sizeof(buf), "%d", my_mag[my_slot]);
+            Color c = (my_mag[my_slot] == 0) ? RED : (my_mag[my_slot] <= w->mag / 4 ? ORANGE : RAYWHITE);
+            int wmag = MeasureText(buf, 40);
+            DrawText(buf, cx - 8 - wmag, UIH - 62, 40, c);
+            DrawText("|", cx - 2, UIH - 60, 36, GRAY);
+            snprintf(buf, sizeof(buf), "%d", my_reserve[my_slot]);
+            DrawText(buf, cx + 14, UIH - 52, 24, LIGHTGRAY);
+        }
+        if (reload_t > 0.0f) {
+            // Barre de rechargement
+            float k = 1.0f - reload_t / (reload_total + 0.05f);
+            DrawRectangle(cx - 70, UIH - 20, 140, 6, Fade(BLACK, 0.5f));
+            DrawRectangle(cx - 70, UIH - 20, (int)(140 * k), 6, (Color){255, 200, 90, 255});
+            DrawText("rechargement", cx - MeasureText("rechargement", 14) / 2, UIH - 36, 14, LIGHTGRAY);
+        } else if (w->mag > 0 && my_mag[my_slot] == 0) {
+            const char *m = my_reserve[my_slot] > 0 ? "R : recharger" : "plus de munitions";
+            DrawText(m, cx - MeasureText(m, 14) / 2, UIH - 36, 14, RED);
+        }
+        // L'autre arme, en petit
+        int other = (my_slot == SLOT_PRIMARY) ? SLOT_SECONDARY : SLOT_PRIMARY;
+        snprintf(buf, sizeof(buf), "%d  %s  %d|%d", other + 1, WEAPONS[my_weapon[other]].name,
+                 my_mag[other], my_reserve[other]);
+        DrawText(buf, cx + 120, UIH - 52, 14, GRAY);
+    }
+    if (weapon_msg_t > 0.0f)
+        DrawText(weapon_msg, UIW / 2 - MeasureText(weapon_msg, 20) / 2, 90, 20,
+                 Fade((Color){255, 200, 90, 255}, weapon_msg_t > 1.0f ? 1.0f : weapon_msg_t));
+
+    // --- La bombe : ce qu'il faut savoir, et ce qu'il faut faire ---
+    if (me && me->active && snap.round_phase == ROUND_PLAY) {
+        const Color AMBER = {255, 200, 90, 255};
+        const char *key = TouchUsed() ? "BOMBE" : "E";
+        int y0 = 110;
+        if (snap.bomb_state == BOMB_CARRIED && snap.bomb_carrier == my_id && me->alive) {
+            DrawText("Vous portez la bombe", UIW / 2 - MeasureText("Vous portez la bombe", 20) / 2, y0, 20, AMBER);
+            // Le site le plus proche, et sa distance
+            int best = 0; float bd = 1e9f;
+            for (int i = 0; i < BOMB_SITE_COUNT; i++) {
+                float cx = (BOMB_SITES[i].min.x + BOMB_SITES[i].max.x) / 2, cz = (BOMB_SITES[i].min.z + BOMB_SITES[i].max.z) / 2;
+                float d = sqrtf((cx - my_sim.pos.x) * (cx - my_sim.pos.x) + (cz - my_sim.pos.z) * (cz - my_sim.pos.z));
+                if (d < bd) { bd = d; best = i; }
+            }
+            if (BombSiteAt(my_sim.pos) >= 0)
+                snprintf(buf, sizeof(buf), "Site %c : maintenez %s, immobile, pour la poser", 'A' + BombSiteAt(my_sim.pos), key);
+            else
+                snprintf(buf, sizeof(buf), "Site %c à %.0f m", 'A' + best, bd);
+            DrawText(buf, UIW / 2 - MeasureText(buf, 16) / 2, y0 + 24, 16, LIGHTGRAY);
+        } else if (snap.bomb_state == BOMB_DROPPED && me->team == BOMB_TEAM) {
+            DrawText("La bombe est au sol", UIW / 2 - MeasureText("La bombe est au sol", 18) / 2, y0, 18, AMBER);
+        } else if (snap.bomb_state == BOMB_PLANTED) {
+            snprintf(buf, sizeof(buf), "BOMBE POSÉE (site %c) : %.0f s", 'A' + snap.bomb_site, snap.bomb_timer);
+            Color c = (snap.bomb_timer < 10.0f) ? RED : AMBER;
+            DrawText(buf, UIW / 2 - MeasureText(buf, 22) / 2, y0, 22, c);
+            if (me->team != BOMB_TEAM && me->alive) {
+                float dx = snap.bomb_x - my_sim.pos.x, dz = snap.bomb_z - my_sim.pos.z;
+                float d = sqrtf(dx * dx + dz * dz);
+                if (d <= BOMB_USE_RANGE) snprintf(buf, sizeof(buf), "Maintenez %s, immobile, pour désamorcer (%.0f s)", key, BOMB_DEFUSE_TIME);
+                else snprintf(buf, sizeof(buf), "La bombe est à %.0f m", d);
+                DrawText(buf, UIW / 2 - MeasureText(buf, 16) / 2, y0 + 26, 16, LIGHTGRAY);
+            }
+        }
+        // Barre de progression : pose ou désamorçage en cours (par qui que ce soit)
+        if (snap.bomb_actor != 255 && snap.bomb_progress > 0.0f) {
+            const char *what = (snap.bomb_state == BOMB_PLANTED) ? "désamorçage" : "pose de la bombe";
+            snprintf(buf, sizeof(buf), "%s : %s", PlayerName(snap.bomb_actor), what);
+            DrawText(buf, UIW / 2 - MeasureText(buf, 16) / 2, y0 + 50, 16, RAYWHITE);
+            DrawRectangle(UIW / 2 - 100, y0 + 72, 200, 10, Fade(BLACK, 0.5f));
+            DrawRectangle(UIW / 2 - 100, y0 + 72, (int)(200 * snap.bomb_progress), 10, AMBER);
+        }
+    }
+    // Flash de l'explosion
+    if (explosion_t > 0.7f)
+        DrawRectangle(0, 0, UIW, UIH, Fade(WHITE, (explosion_t - 0.7f) / 0.3f * 0.8f));
 
     DrawCrosshair();
 
@@ -1004,12 +1637,35 @@ static void DrawHUD(void)
         y += 22;
     }
 
-    // --- Écran de mort ---
-    if (me && me->active && !me->alive && !snap.match_over) {
+    // --- Éliminé : on attend la fin de la manche (pas de respawn) ---
+    if (me && me->active && !me->alive && !snap.match_over && snap.round_phase != ROUND_END) {
         DrawRectangle(0, 0, UIW, UIH, Fade(BLACK, 0.5f));
-        const char *msg = "Vous êtes mort — respawn imminent...";
-        DrawText(msg, UIW / 2 - MeasureText(msg, 30) / 2,
-                 UIH / 2 - 15, 30, RED);
+        const char *msg = "Éliminé : en attente de la prochaine manche";
+        DrawText(msg, UIW / 2 - MeasureText(msg, 30) / 2, UIH / 2 - 15, 30, RED);
+    }
+
+    // --- Fin de manche, ou attente d'une équipe adverse ---
+    if (!snap.match_over && snap.round_phase == ROUND_END) {
+        DrawRectangle(0, 0, UIW, UIH, Fade(BLACK, 0.45f));
+        Color c = RAYWHITE;
+        if (snap.round_winner < TEAM_COUNT) {
+            snprintf(buf, sizeof(buf), "MANCHE %d : %s L'EMPORTE", snap.round,
+                     snap.round_winner == TEAM_RED ? "ROUGE" : "BLEU");
+            c = TeamColor(snap.round_winner);
+        } else {
+            snprintf(buf, sizeof(buf), "MANCHE %d : NULLE", snap.round);
+        }
+        DrawText(buf, UIW / 2 - MeasureText(buf, 36) / 2, UIH / 2 - 30, 36, c);
+        const char *why = (round_end_reason == RE_EXPLODED) ? "La bombe a explosé"
+                        : (round_end_reason == RE_DEFUSED)  ? "Bombe désamorcée"
+                        : (round_end_reason == RE_TIME)     ? "Temps écoulé"
+                        : (round_end_reason == RE_DRAW)     ? "" : "Équipe éliminée";
+        if (why[0]) DrawText(why, UIW / 2 - MeasureText(why, 20) / 2, UIH / 2 + 46, 20, LIGHTGRAY);
+        snprintf(buf, sizeof(buf), "manche suivante dans %d s", (int)(snap.round_time + 0.999f));
+        DrawText(buf, UIW / 2 - MeasureText(buf, 20) / 2, UIH / 2 + 20, 20, LIGHTGRAY);
+    } else if (!snap.match_over && snap.round_phase == ROUND_WAIT) {
+        const char *msg = "En attente d'une équipe adverse...";
+        DrawText(msg, UIW / 2 - MeasureText(msg, 24) / 2, UIH / 2 - 12, 24, LIGHTGRAY);
     }
 
     // --- Fin de match ---
@@ -1042,159 +1698,178 @@ static void DrawHUD(void)
     }
 
     // --- Alerte si le serveur ne répond plus depuis 2 s ---
-    if (GetTime() - last_server_msg > 2.0) {
+    if (last_server_msg >= 0.0 && GetTime() - last_server_msg > 2.0) {
         const char *msg = "Connexion au serveur perdue...";
         DrawText(msg, UIW / 2 - MeasureText(msg, 20) / 2, 60, 20, ORANGE);
     }
 }
 
 //----------------------------------------------------------------------------------
-// Boucle principale
+// Menus
 //----------------------------------------------------------------------------------
-#if MOBILE_UI
-//----------------------------------------------------------------------------------
-// Écran de connexion du mobile
-//----------------------------------------------------------------------------------
-// Un téléphone n'a pas de ligne de commande : impossible de passer l'adresse
-// du serveur en argument. On ouvre donc la fenêtre d'abord et on demande
-// l'adresse au doigt, sur un pavé numérique (chiffres, point, effacement).
-//
-// raylib fait passer le tactile pour la souris sur Android : le même code
-// marche sur PC, ce qui permet de régler cet écran sans téléphone.
-//
-// Remplit ip (cap octets) et renvoie true quand la connexion est établie,
-// false si le joueur quitte l'application.
-static bool MobileConnectScreen(char *ip, int cap, const char *name)
+// Applique ce que les options changent hors du jeu lui-même
+static void ApplyOptions(void)
 {
-    // Pavé 3 x 4. Le « : » sert à viser un port autre que celui par défaut
-    // (« 192.168.1.20:27015 ») ; l'effacement a son propre bouton, à droite
-    // du champ de saisie.
-    static const char *keys[12] = { "1","2","3","4","5","6","7","8","9",".","0",":" };
+    TouchSetSensitivity(options.touch_sens);
+    SoundSetVolume(options.volume);
+#if !MOBILE_UI
+    if (options.fullscreen != IsWindowFullscreen()) ToggleFullscreen();
+#endif
+}
+
+// Une image d'un écran de menu, de la lecture du pointeur au dessin :
+// le fond est fourni par l'appelant (déjà dessiné), on ajoute l'écran
+// courant par-dessus, en unités d'interface, puis l'aperçu 3D s'il y en a.
+static MenuAction MenuDrawFrame(MenuScreen *screen, bool in_game, const char *status)
+{
+    UiBegin(ui_scale);
+    MenuSetScreen(ui_w, ui_h, MOBILE_UI);
+    if (UiReleased()) SoundPlay(SND_CLICK, 0.5f, 1.0f);
+    BeginMode2D(UiCamera());
+    MenuAction a = MenuFrame(screen, in_game, status);
+    EndMode2D();
+    DrawWeaponPreview();
+    return a;
+}
+
+// Écran d'accueil : serveur, pseudo, armes, options. Boucle jusqu'à la
+// connexion (vrai) ou l'abandon (faux). Sur mobile, c'est le seul moyen
+// d'entrer l'adresse ; sur PC, il remplace la ligne de commande.
+static bool MainMenuLoop(void)
+{
     const Color BG = {18, 20, 26, 255};
-    char msg[80] = "";
+    MenuScreen screen = MENU_MAIN;
+    char status[96] = "";
+#if defined(PLATFORM_ANDROID)
+    double last_log = 0.0;
+#endif
 
-    for (;;) {
-        if (WindowShouldClose()) return false;
+    while (!WindowShouldClose()) {
         UiUpdate();
-
-        // Disposition, en unités d'interface : pavé 3 x 4 centré
-        float bw = 112, bh = 78, gap = 12;
-        float gx = ui_w / 2 - (3 * bw + 2 * gap) / 2, gy = 236;
-        Rectangle connect = { ui_w / 2 - 140, gy + 4 * (bh + gap) + 14, 280, 78 };
-        Rectangle field = { ui_w / 2 - 200, 150, 400, 62 };
-        Rectangle erase = { field.x + field.width + 12, field.y, 76, field.height };
-
-        // --- Un appui : on teste les boutons sous le doigt ---
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            Vector2 m = GetMousePosition();
-            m.x /= ui_scale;      // les clics arrivent en pixels réels
-            m.y /= ui_scale;
-            for (int i = 0; i < 12; i++) {
-                Rectangle r = { gx + (i % 3) * (bw + gap), gy + (i / 3) * (bh + gap), bw, bh };
-                if (!CheckCollisionPointRec(m, r)) continue;
-                size_t len = strlen(ip);
-                if (len + 1 < (size_t)cap) { ip[len] = keys[i][0]; ip[len + 1] = '\0'; }
-            }
-            if (CheckCollisionPointRec(m, erase)) {
-                size_t len = strlen(ip);
-                if (len > 0) ip[len - 1] = '\0';
-            }
-            if (CheckCollisionPointRec(m, connect) && ip[0] != '\0') {
-                // NetConnect bloque jusqu'à 5 s (10 tentatives) : on affiche
-                // d'abord une image, sinon l'écran semble figé.
-                BeginDrawing();
-                ClearBackground(BG);
-                BeginMode2D(UiCamera());
-                const char *t = "Connexion...";
-                DrawText(t, (int)(ui_w / 2) - MeasureText(t, 36) / 2, 320, 36, RAYWHITE);
-                EndMode2D();
-                EndDrawing();
-
-                if (NetConnect(ip, name)) return true;
-                snprintf(msg, sizeof(msg), "Serveur injoignable : %s", ip);
-            }
+#if defined(PLATFORM_ANDROID)
+        // Témoin pour logcat, une fois par seconde : l'état BRUT des entrées
+        // et la taille que LE JEU voit (le test en CI s'y cale).
+        if (GetTime() - last_log >= 1.0) {
+            last_log = GetTime();
+            TraceLog(LOG_INFO, "TACTILE: etat touches=%d souris=%d ecran=%dx%d t=%.0f",
+                     GetTouchPointCount(), IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1 : 0,
+                     GetScreenWidth(), GetScreenHeight(), GetTime());
         }
-
-        // --- Dessin ---
+#endif
         BeginDrawing();
         ClearBackground(BG);
-        BeginMode2D(UiCamera());
-
-        const char *title = "EMA TOURNAMENT";
-        DrawText(title, (int)(ui_w / 2) - MeasureText(title, 44) / 2, 52, 44, RAYWHITE);
-        const char *sub2 = "Adresse du serveur (port 7777 par defaut)";
-        DrawText(sub2, (int)(ui_w / 2) - MeasureText(sub2, 20) / 2, 112, 20, GRAY);
-
-        // Champ de saisie, et son bouton d'effacement
-        DrawRectangleRec(field, Fade(BLACK, 0.5f));
-        DrawRectangleLinesEx(field, 2, Fade(RAYWHITE, 0.4f));
-        const char *shown = (ip[0] != '\0') ? ip : "___.___.___.___";
-        DrawText(shown, (int)(field.x + field.width / 2) - MeasureText(shown, 34) / 2,
-                 (int)field.y + 14, 34, ip[0] ? RAYWHITE : DARKGRAY);
-        DrawRectangleRec(erase, Fade(RAYWHITE, 0.14f));
-        DrawRectangleLinesEx(erase, 1, Fade(RAYWHITE, 0.3f));
-        DrawText("<", (int)(erase.x + erase.width / 2) - MeasureText("<", 32) / 2,
-                 (int)(erase.y + erase.height / 2) - 16, 32, RAYWHITE);
-
-        // Pavé
-        for (int i = 0; i < 12; i++) {
-            Rectangle r = { gx + (i % 3) * (bw + gap), gy + (i / 3) * (bh + gap), bw, bh };
-            DrawRectangleRec(r, Fade(RAYWHITE, 0.12f));
-            DrawRectangleLinesEx(r, 1, Fade(RAYWHITE, 0.3f));
-            DrawText(keys[i], (int)(r.x + r.width / 2) - MeasureText(keys[i], 32) / 2,
-                     (int)(r.y + r.height / 2) - 16, 32, RAYWHITE);
-        }
-
-        // Bouton CONNECTER
-        bool ready = (ip[0] != '\0');
-        DrawRectangleRec(connect, Fade(ready ? (Color){70, 160, 90, 255} : GRAY, 0.8f));
-        DrawRectangleLinesEx(connect, 2, Fade(RAYWHITE, 0.5f));
-        const char *cl = "CONNECTER";
-        DrawText(cl, (int)(connect.x + connect.width / 2) - MeasureText(cl, 30) / 2,
-                 (int)(connect.y + 24), 30, RAYWHITE);
-
-        if (msg[0] != '\0')
-            DrawText(msg, (int)(ui_w / 2) - MeasureText(msg, 20) / 2,
-                     (int)(connect.y + connect.height + 16), 20, (Color){235, 90, 70, 255});
-
-        EndMode2D();
+        MenuAction a = MenuDrawFrame(&screen, false, status);
+        if (options.show_fps) DrawFPS(GetScreenWidth() - 90, GetScreenHeight() - 30);
         EndDrawing();
+#if defined(PLATFORM_ANDROID)
+        if (UiReleased()) {
+            Vector2 u = UiPointer();
+            TraceLog(LOG_INFO, "TACTILE: appui relache en (%.0f, %.0f) px -> (%.0f, %.0f) unites",
+                     u.x * ui_scale, u.y * ui_scale, u.x, u.y);
+        }
+#endif
+        switch (a) {
+        case MA_QUIT:
+            return false;
+        case MA_OPTIONS_CHANGED:
+        case MA_LOADOUT:
+            OptionsSave();
+            ApplyOptions();
+            if (a == MA_LOADOUT) screen = MENU_MAIN;
+            break;
+        case MA_PLAY: {
+            const char *ip = options.server[0] ? options.server : "127.0.0.1";
+            const char *name = options.name[0] ? options.name : "Joueur";
+            // NetConnect bloque jusqu'à 5 s (10 tentatives) : on affiche
+            // d'abord une image, sinon l'écran semble figé.
+            BeginDrawing();
+            ClearBackground(BG);
+            BeginMode2D(UiCamera());
+            UiTextCentered(TextFormat("Connexion à %s...", ip), ui_w / 2, 320, 36, RAYWHITE);
+            EndMode2D();
+            EndDrawing();
+            if (NetConnect(ip, name)) { OptionsSave(); return true; }
+            snprintf(status, sizeof(status), "Serveur injoignable : %s", ip);
+            break;
+        }
+        default:
+            break;
+        }
     }
+    return false;
 }
-#endif  // MOBILE_UI
 
+// Ouvre ou ferme un menu en jeu. Sur PC la souris est rendue au menu et
+// reprise par la visée ; sur mobile les doigts posés sont oubliés pour
+// que le joystick ne reste pas « tenu ».
+static void SetMenu(MenuScreen m)
+{
+    if (m == menu) return;
+    menu = m;
+#if !MOBILE_UI
+    if (menu == MENU_NONE) DisableCursor(); else EnableCursor();
+#endif
+    TouchReset();
+}
+
+//----------------------------------------------------------------------------------
+// Boucle principale
+//----------------------------------------------------------------------------------
 int main(int argc, char **argv)
 {
+    MapInit();
+    OptionsLoad();
+    // Ligne de commande (PC) : ./client [ip[:port]] [pseudo] saute l'accueil
+    const char *ip_arg = (argc > 1) ? argv[1] : NULL;
+    if (argc > 2) snprintf(options.name, sizeof(options.name), "%s", argv[2]);
+    const char *name = options.name[0] ? options.name : "Joueur";
+
 #if !MOBILE_UI
-    const char *ip = (argc > 1) ? argv[1] : "127.0.0.1";   // serveur à joindre
+    // raylib moins bavard dans la console. PAS sur mobile : logcat y est le
+    // seul canal de diagnostic, et c'est sur ses messages INFO (« Program
+    // shader loaded ») que le test de fumee en CI verifie que l'affichage
+    // s'est initialise.
+    SetTraceLogLevel(LOG_WARNING);
 #endif
-    const char *name = (argc > 2) ? argv[2] : "Joueur";
 
-    SetTraceLogLevel(LOG_WARNING);   // raylib moins bavard dans la console
+    bool connected = false;
+    if (ip_arg) {
+        // PC : on se connecte AVANT d'ouvrir la fenêtre, inutile de l'ouvrir
+        // si le serveur est injoignable
+        printf("EMA Tournament — connexion à %s en tant que \"%s\"\n", ip_arg, name);
+        if (!NetConnect(ip_arg, name)) return 1;
+        snprintf(options.server, sizeof(options.server), "%s", ip_arg);
+        connected = true;
+    }
 
-#if MOBILE_UI
-    // Mobile : la fenêtre d'abord (il faut un écran pour demander l'adresse
-    // du serveur), et pas de capture du curseur — on a besoin du doigt.
-    InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament");
+#if defined(PLATFORM_ANDROID)
+    // 0 x 0 : raylib prend la taille NATIVE de l'écran. Avec 1280 x 720 il
+    // rendrait en 16:9 et agrandirait l'image avec des bandes noires sur les
+    // côtés (vu dans l'émulateur : « Upscaling required »). En natif, c'est
+    // UiUpdate qui adapte le HUD au ratio réel de l'écran.
+    InitWindow(0, 0, "EMA Tournament");
     SetTargetFPS(60);                // 60 Hz : suffisant, et ménage la batterie
+#else
+    InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament");
+    SetTargetFPS(144);
+    SetExitKey(KEY_NULL);            // Échap ouvre le menu, il ne quitte plus
+#endif
     UiUpdate();
-    char ip_typed[64] = "";
-    if (!MobileConnectScreen(ip_typed, (int)sizeof(ip_typed), name)) {
+    SoundInit();       // synthétise les sons (muet sans carte son)
+    ApplyOptions();
+
+    if (!connected && !MainMenuLoop()) {
         CloseWindow();
         return 0;
     }
-#else
-    printf("FPS TDM — connexion à %s en tant que \"%s\"\n", ip, name);
-    // PC : on se connecte AVANT d'ouvrir la fenêtre, inutile de l'ouvrir si
-    // le serveur est injoignable
-    if (!NetConnect(ip, name)) return 1;
-
-    InitWindow(SCREEN_W, SCREEN_H, "EMA Tournament — TDM");
-    SetTargetFPS(144);
+#if !MOBILE_UI
     DisableCursor();   // capture la souris (visée FPS)
 #endif
+    // L'équipement choisi : le serveur l'applique au spawn
+    SendLoadout();
 
     ModelsInit();   // crée les maillages des personnages (après InitWindow)
+    TexturesInit(); // génère les textures de la carte et les donne au lot
     // Un état d'animation par joueur, décalé par son numéro de slot : deux
     // poussins ne clignent pas des yeux au même instant et ne s'ébrouent
     // pas ensemble.
@@ -1204,41 +1879,63 @@ int main(int argc, char **argv)
 
     // Position de départ : premier spawn de notre équipe. Le premier
     // snapshot du serveur corrigera si besoin.
-    my_pos = TEAM_SPAWNS[my_team][0];
+    my_sim.pos = TEAM_SPAWNS[my_team][0];
+    my_sim.on_ground = true;
     my_yaw = (my_team == TEAM_RED) ? 0.0f : (float)M_PI;   // face au centre
     memset(&snap, 0, sizeof(snap));
+    my_weapon[SLOT_PRIMARY] = options.primary;
+    my_weapon[SLOT_SECONDARY] = options.secondary;
+    last_server_msg = GetTime();
 
     double last_state_send = 0.0;
     float fov_current = FOV_HIP;
     Camera3D cam = {0};
+    char menu_status[96] = "";
 
-    while (!WindowShouldClose()) {
+    while (!WindowShouldClose() && !quit_requested) {
         // dt plafonné : après un gel (fenêtre déplacée...), pas de pas de
         // physique géant qui ferait traverser les murs
         float dt = GetFrameTime();
         if (dt > 0.05f) dt = 0.05f;
 
         UiUpdate();                         // l'écran a pu tourner (mobile)
-        TouchUpdate(ui_scale, ui_w, ui_h);  // doigts posés cette image
         NetReceive();                       // snapshots + événements
 
-        if (my_alive && !snap.match_over) UpdateLocalPlayer(dt);
+        // --- Menus : Échap (PC) ou le bouton MENU (mobile) ; B : armes ---
+        PlayerInput menu_in = {0};
+        if (menu == MENU_NONE) {
+            TouchUpdate(ui_scale, ui_w, ui_h);  // doigts posés cette image
+            TouchApply(&menu_in, ads);          // seul in.menu nous intéresse ici
+        }
+#if !MOBILE_UI
+        if (IsKeyPressed(KEY_ESCAPE)) SetMenu(menu == MENU_NONE ? MENU_PAUSE : MENU_NONE);
+        if (IsKeyPressed(KEY_B) && menu == MENU_NONE) SetMenu(MENU_WEAPONS);
+#endif
+        if (menu_in.menu) SetMenu(MENU_PAUSE);
+
+        if (menu == MENU_NONE && my_alive && !snap.match_over) UpdateLocalPlayer(dt);
         UpdateViewEffects(dt);              // recul, bloom, minuteurs...
         InterpolateOthers(dt);              // lissage des autres joueurs
         UpdatePlayerCamera(&cam, dt, &fov_current);
+        SoundSetListener(cam.position, my_yaw);
 
-        // Envoi périodique de notre position au serveur
+        // Envoi périodique de nos entrées au serveur (vide = battement de cœur)
         if (GetTime() - last_state_send > 1.0 / CLIENT_SEND_HZ) {
             last_state_send = GetTime();
-            NetSendState();
+            NetSendInputs();
         }
 
         BeginDrawing();
         ClearBackground((Color){135, 170, 200, 255});   // ciel
+        // Ciel en dégradé : bleu profond au zénith, pâle et chaud à l'horizon
+        DrawRectangleGradientV(0, 0, GetScreenWidth(), GetScreenHeight(),
+                               (Color){86, 134, 196, 255}, (Color){208, 214, 222, 255});
 
         BeginMode3D(cam);       // 1) la scène : map + joueurs + traçantes
-        DrawMap();
+        BatchBegin();           //    toutes les primitives des personnages et de
+        DrawMap();              //    l'enseigne dans UN maillage, dessiné à BatchEnd
         DrawPlayers();
+        BatchEnd();
         EndMode3D();
 
         DrawViewModel();        // 2) l'arme, par-dessus la scène
@@ -1246,16 +1943,48 @@ int main(int argc, char **argv)
         // 3) l'interface, en unités d'interface : la caméra 2D la met à
         // l'échelle de l'écran réel (indispensable sur mobile).
         BeginMode2D(UiCamera());
+        DrawScopeOverlay();
         DrawNameTags(cam);
         DrawHUD();
-        TouchDraw();            // joystick et boutons (mobile seulement)
-        DrawFPS(UIW - 90, UIH - 30);
+        if (menu == MENU_NONE) TouchDraw();   // joystick et boutons (mobile seulement)
+        if (options.show_fps) DrawFPS(UIW - 90, UIH - 30);
         EndMode2D();
+
+        // 4) le menu, s'il est ouvert, par-dessus tout
+        if (menu != MENU_NONE) {
+            MenuScreen before = menu;
+            MenuAction a = MenuDrawFrame(&menu, true, menu_status);
+            if (menu != before) SetMenu(menu);
+            switch (a) {
+            case MA_RESUME:  SetMenu(MENU_NONE); break;
+            case MA_QUIT:    quit_requested = true; break;
+            case MA_LOADOUT:
+                OptionsSave();
+                SendLoadout();
+                SetMenu(MENU_NONE);
+                break;
+            case MA_OPTIONS_CHANGED:
+                OptionsSave();
+                ApplyOptions();
+                break;
+            default: break;
+            }
+        }
         EndDrawing();
+        {
+            // Le bouton d'arme du mobile affiche les munitions de l'arme en main
+            char lbl[24];
+            const WeaponStats *w = CurWeapon();
+            if (w->mag > 0) snprintf(lbl, sizeof(lbl), "%d|%d", my_mag[my_slot], my_reserve[my_slot]);
+            else snprintf(lbl, sizeof(lbl), "ARME");
+            TouchSetAmmoLabel(lbl);
+        }
     }
 
     NetSendDisconnect();
+    TexturesClose();
     ModelsClose();     // libère les maillages (avant CloseWindow)
+    SoundClose();
     CloseWindow();
     SocketClose(sock_fd);
     PlatformNetShutdown();
