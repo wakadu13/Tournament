@@ -39,6 +39,7 @@ typedef struct {
     bool    reload;    // recharger (impulsion)
     bool    swap;      // changer d'arme (impulsion)
     bool    menu;      // ouvrir le menu (impulsion)
+    bool    use;       // action maintenue : poser / désamorcer la bombe
 } PlayerInput;
 
 void TouchReset(void);   // oublie tous les doigts (début de partie)

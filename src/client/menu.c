@@ -236,6 +236,8 @@ static MenuAction OptionsScreen(MenuScreen *screen, bool in_game)
     }
     changed |= UiSlider((Rectangle){ x, y, w, 60 }, "Champ de vision", &options.fov, 60.0f, 100.0f, "%.0f°");
     y += 68;
+    changed |= UiSlider((Rectangle){ x, y, w, 60 }, "Volume", &options.volume, 0.0f, 1.0f, "%.2f");
+    y += 68;
     changed |= UiToggle((Rectangle){ x, y, w, 48 }, "Inverser l'axe vertical", &options.invert_y);
     y += 54;
     if (!mobile) {

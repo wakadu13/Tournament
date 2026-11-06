@@ -22,7 +22,8 @@ typedef struct {
     struct sockaddr_in addr;
     char               name[NAME_MAX];
     Team               team;
-    bool               is_bot;      // relayé aux clients pour le rendu
+    int                is_bot;      // BotKind, relayé aux clients pour le rendu
+    bool               use;         // action maintenue (dernière entrée) : bombe
 
     PlayerSim sim;          // position, vitesses, au sol : simulé ICI, par les entrées du client
     float yaw, pitch;       // la vue, relayée telle quelle
@@ -76,6 +77,15 @@ static int        round_no = 0;
 static RoundPhase round_phase = ROUND_WAIT;
 static float      round_timer = 0.0f;
 static int        round_winner = TEAM_COUNT;   // en ROUND_END ; TEAM_COUNT = nulle
+
+// --- La bombe ---
+static BombState bomb_state = BOMB_NONE;
+static int       bomb_carrier = -1;    // porteur (CARRIED)
+static int       bomb_site = 0;        // site de pose (PLANTED)
+static int       bomb_actor = -1;      // qui pose / désamorce en ce moment
+static V3        bomb_pos;             // au sol (DROPPED, PLANTED)
+static float     bomb_timer = 0.0f;    // avant l'explosion
+static float     bomb_progress = 0.0f; // secondes de pose / désamorçage accumulées
 static socket_t sock_fd = SOCKET_NONE;
 
 // Horloge monotone de la boucle de simulation (voir platform.h)
@@ -167,6 +177,25 @@ static void StartRound(void)
         SpawnPlayer(&players[i]);
         BroadcastEvent(EV_RESPAWN, i, 0, 0);
     }
+    // La bombe à un T tiré au sort, humain ou soldat (un poussin zombie ne
+    // sait pas la poser). Sans porteur possible : manche sans bombe, la
+    // règle du temps redevient « le plus de survivants ».
+    bomb_state = BOMB_NONE;
+    bomb_carrier = -1;
+    bomb_actor = -1;
+    bomb_progress = 0.0f;
+    bomb_timer = 0.0f;
+    {
+        int cand[MAX_PLAYERS], n = 0;
+        for (int i = 0; i < MAX_PLAYERS; i++)
+            if (players[i].active && players[i].team == BOMB_TEAM && players[i].is_bot != BOT_ZOMBIE)
+                cand[n++] = i;
+        if (n > 0) {
+            bomb_carrier = cand[rand() % n];
+            bomb_state = BOMB_CARRIED;
+            BroadcastEvent(EV_BOMB_PICKED, (uint8_t)bomb_carrier, 0, 0);
+        }
+    }
     BroadcastEvent(EV_ROUND_START, (uint8_t)round_no, 0, 0);
     printf("[~] Manche %d : %d ROUGE contre %d BLEU\n", round_no,
            CountTeam(TEAM_RED), CountTeam(TEAM_BLUE));
@@ -174,13 +203,13 @@ static void StartRound(void)
 
 // Fin de manche : un point à l'équipe gagnante (aucun si nulle), pause,
 // et le match se termine à ROUNDS_TO_WIN.
-static void EndRound(int win)
+static void EndRound(int win, int reason)
 {
     round_phase = ROUND_END;
     round_timer = ROUND_END_DELAY;
     round_winner = win;
     if (win < TEAM_COUNT) team_score[win]++;
-    BroadcastEvent(EV_ROUND_END, (uint8_t)win, (uint8_t)round_no, 0);
+    BroadcastEvent(EV_ROUND_END, (uint8_t)win, (uint8_t)round_no, reason);
     if (win < TEAM_COUNT)
         printf("[~] Manche %d : %s l'emporte (%d - %d)\n", round_no,
                win == TEAM_RED ? "ROUGE" : "BLEU", team_score[TEAM_RED], team_score[TEAM_BLUE]);
@@ -194,6 +223,120 @@ static void EndRound(int win)
         BroadcastEvent(EV_MATCH_OVER, (uint8_t)winner, 0, 0);
         printf("[*] MATCH TERMINÉ — victoire équipe %s\n",
                winner == TEAM_RED ? "ROUGE" : "BLEUE");
+    }
+}
+
+static float HSpeed(const Player *p)
+{
+    return sqrtf(p->sim.vel.x * p->sim.vel.x + p->sim.vel.z * p->sim.vel.z);
+}
+
+// La bombe, à chaque tick d'une manche en cours : portée, lâchée à la
+// mort du porteur, ramassée par un T, posée sur un site (action maintenue
+// à l'arrêt pendant BOMB_PLANT_TIME), désamorcée par un CT (idem,
+// BOMB_DEFUSE_TIME, à BOMB_USE_RANGE), ou explosée au bout de BOMB_TIMER.
+static void UpdateBomb(float dt)
+{
+    switch (bomb_state) {
+    case BOMB_CARRIED: {
+        Player *c = (bomb_carrier >= 0) ? &players[bomb_carrier] : NULL;
+        if (!c || !c->active || !c->alive) {
+            bomb_state = BOMB_DROPPED;
+            if (c) bomb_pos = c->sim.pos;
+            BroadcastEvent(EV_BOMB_DROPPED, (uint8_t)bomb_carrier, 0, 0);
+            printf("[~] La bombe est au sol\n");
+            bomb_carrier = -1;
+            bomb_actor = -1;
+            bomb_progress = 0.0f;
+            break;
+        }
+        int site = BombSiteAt(c->sim.pos);
+        if (site >= 0 && c->use && c->sim.on_ground && HSpeed(c) < 0.5f) {
+            bomb_actor = bomb_carrier;
+            bomb_progress += dt;
+            if (bomb_progress >= BOMB_PLANT_TIME) {
+                bomb_state = BOMB_PLANTED;
+                bomb_pos = c->sim.pos;
+                bomb_site = site;
+                bomb_timer = BOMB_TIMER;
+                bomb_progress = 0.0f;
+                bomb_actor = -1;
+                BroadcastEvent(EV_BOMB_PLANTED, (uint8_t)bomb_carrier, (uint8_t)site, 0);
+                printf("[!] %s a posé la bombe sur le site %c\n", c->name, 'A' + site);
+                bomb_carrier = -1;
+            }
+        } else {
+            bomb_actor = -1;
+            bomb_progress = 0.0f;
+        }
+        break;
+    }
+    case BOMB_DROPPED:
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            Player *p = &players[i];
+            if (!p->active || !p->alive || p->team != BOMB_TEAM || p->is_bot == BOT_ZOMBIE) continue;
+            float dx = p->sim.pos.x - bomb_pos.x, dz = p->sim.pos.z - bomb_pos.z;
+            if (dx * dx + dz * dz > BOMB_USE_RANGE * BOMB_USE_RANGE) continue;
+            bomb_state = BOMB_CARRIED;
+            bomb_carrier = i;
+            BroadcastEvent(EV_BOMB_PICKED, (uint8_t)i, 0, 0);
+            printf("[~] %s ramasse la bombe\n", p->name);
+            break;
+        }
+        break;
+    case BOMB_PLANTED: {
+        bomb_timer -= dt;
+        // Un CT la désamorce : le premier trouvé, à portée, immobile, action maintenue
+        int actor = -1;
+        for (int i = 0; i < MAX_PLAYERS && actor < 0; i++) {
+            Player *p = &players[i];
+            if (!p->active || !p->alive || p->team == BOMB_TEAM || !p->use) continue;
+            float dx = p->sim.pos.x - bomb_pos.x, dz = p->sim.pos.z - bomb_pos.z;
+            if (dx * dx + dz * dz > BOMB_USE_RANGE * BOMB_USE_RANGE) continue;
+            if (HSpeed(p) >= 0.5f) continue;
+            actor = i;
+        }
+        if (actor >= 0 && actor == bomb_actor) bomb_progress += dt;
+        else bomb_progress = (actor >= 0) ? dt : 0.0f;
+        bomb_actor = actor;
+        if (bomb_progress >= BOMB_DEFUSE_TIME) {
+            bomb_state = BOMB_DEFUSED;
+            BroadcastEvent(EV_BOMB_DEFUSED, (uint8_t)actor, 0, 0);
+            printf("[!] %s a désamorcé la bombe\n", players[actor].name);
+            bomb_actor = -1;
+            EndRound(TEAM_RED, RE_DEFUSED);
+            break;
+        }
+        if (bomb_timer <= 0.0f) {
+            bomb_state = BOMB_EXPLODED;
+            bomb_timer = 0.0f;
+            bomb_actor = -1;
+            BroadcastEvent(EV_BOMB_EXPLODED, 0, (uint8_t)bomb_site, 0);
+            printf("[!] La bombe a explosé (site %c)\n", 'A' + bomb_site);
+            // Dégâts décroissants dans le rayon, pour tout le monde
+            for (int i = 0; i < MAX_PLAYERS; i++) {
+                Player *p = &players[i];
+                if (!p->active || !p->alive) continue;
+                float dx = p->sim.pos.x - bomb_pos.x, dy = p->sim.pos.y - bomb_pos.y,
+                      dz = p->sim.pos.z - bomb_pos.z;
+                float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (d >= BOMB_RADIUS) continue;
+                int dmg = (int)(BOMB_DAMAGE * (1.0f - d / BOMB_RADIUS));
+                p->health -= dmg;
+                BroadcastEvent(EV_HIT, i, i, dmg);
+                if (p->health <= 0) {
+                    p->alive = false;
+                    p->deaths++;
+                    BroadcastEvent(EV_KILL, i, i, WPN_COUNT);   // WPN_COUNT = la bombe
+                    printf("[*] %s a été soufflé par la bombe\n", p->name);
+                }
+            }
+            EndRound(TEAM_BLUE, RE_EXPLODED);
+        }
+        break;
+    }
+    default:
+        break;
     }
 }
 
@@ -217,12 +360,21 @@ static void UpdateRound(float dt)
             break;
         }
         round_timer -= dt;
+        UpdateBomb(dt);                       // peut finir la manche (explosion, désamorçage)
+        if (round_phase != ROUND_PLAY) break;
         int ar = CountAlive(TEAM_RED), ab = CountAlive(TEAM_BLUE);
-        if (ar == 0 && ab == 0)      EndRound(TEAM_COUNT);
-        else if (ar == 0)            EndRound(TEAM_BLUE);
-        else if (ab == 0)            EndRound(TEAM_RED);
-        else if (round_timer <= 0.0f)
-            EndRound(ar > ab ? TEAM_RED : (ab > ar ? TEAM_BLUE : TEAM_COUNT));
+        if (bomb_state == BOMB_PLANTED) {
+            // Bombe posée : la manche continue jusqu'à l'explosion ou au
+            // désamorçage, même sans T vivant ; plus de CT = T gagnent.
+            if (ar == 0) EndRound(TEAM_BLUE, RE_ELIMINATION);
+        } else if (ar == 0 && ab == 0) EndRound(TEAM_COUNT, RE_DRAW);
+        else if (ar == 0)              EndRound(TEAM_BLUE, RE_ELIMINATION);
+        else if (ab == 0)              EndRound(TEAM_RED, RE_ELIMINATION);
+        else if (round_timer <= 0.0f) {
+            if (bomb_state != BOMB_NONE) EndRound(TEAM_RED, RE_TIME);   // pas posée à temps : les CT tiennent
+            else EndRound(ar > ab ? TEAM_RED : (ab > ar ? TEAM_BLUE : TEAM_COUNT),
+                          ar == ab ? RE_DRAW : RE_TIME);
+        }
         break;
     }
     case ROUND_END:
@@ -273,12 +425,14 @@ static void HandleConnect(const PacketConnect *pkt, const struct sockaddr_in *fr
     memcpy(p->name, pkt->name, NAME_MAX);
     p->name[NAME_MAX - 1] = '\0';
     p->team = team;
-    p->is_bot = pkt->is_bot != 0;
+    p->is_bot = (pkt->is_bot <= BOT_SOLDIER) ? pkt->is_bot : BOT_ZOMBIE;
     p->last_heard = Now();
     // Équipement de départ : un poussin zombie n'a que ses griffes ; un
-    // humain part avec le FAMAS et le Glock, et choisira ensuite (PKT_CL_WEAPON).
-    p->want[SLOT_PRIMARY]   = p->is_bot ? WPN_CLAWS : WPN_FAMAS;
-    p->want[SLOT_SECONDARY] = p->is_bot ? WPN_CLAWS : WPN_GLOCK;
+    // humain ou un soldat part avec le FAMAS et le Glock, et choisira
+    // ensuite (PKT_CL_WEAPON).
+    bool zombie = (p->is_bot == BOT_ZOMBIE);
+    p->want[SLOT_PRIMARY]   = zombie ? WPN_CLAWS : WPN_FAMAS;
+    p->want[SLOT_SECONDARY] = zombie ? WPN_CLAWS : WPN_GLOCK;
     SpawnPlayer(p);
     // En cours de manche, on attend la suivante : posé au spawn mais
     // éliminé d'office, comme dans Counter-Strike. Sinon la manche
@@ -288,8 +442,9 @@ static void HandleConnect(const PacketConnect *pkt, const struct sockaddr_in *fr
     PacketAccept acc = {PKT_SV_ACCEPT, (uint8_t)slot, (uint8_t)p->team};
     SendTo(from, &acc, sizeof(acc));
     BroadcastEvent(EV_PLAYER_JOIN, slot, 0, 0);
-    printf("[+] %s rejoint (slot %d, équipe %s)\n",
-           p->name, slot, p->team == TEAM_RED ? "ROUGE" : "BLEUE");
+    printf("[+] %s rejoint (slot %d, équipe %s%s)\n",
+           p->name, slot, p->team == TEAM_RED ? "ROUGE" : "BLEUE",
+           p->is_bot == BOT_ZOMBIE ? ", poussin zombie" : (p->is_bot == BOT_SOLDIER ? ", bot soldat" : ""));
 }
 
 static void RemovePlayer(int id, const char *why)
@@ -314,7 +469,7 @@ static Player *ValidSender(int id, const struct sockaddr_in *from)
 static void HandleWeapon(const PacketWeapon *pkt, const struct sockaddr_in *from)
 {
     Player *p = ValidSender(pkt->player_id, from);
-    if (!p || p->is_bot) return;      // un zombie garde ses griffes
+    if (!p || p->is_bot == BOT_ZOMBIE) return;      // un zombie garde ses griffes
 
     switch (pkt->action) {
     case WA_LOADOUT: {
@@ -385,6 +540,8 @@ static void HandleShoot(const PacketShoot *pkt, const struct sockaddr_in *from)
         shooter->mag[shooter->slot]--;
     }
     shooter->shoot_cooldown = w->cooldown;
+    // Tout le monde l'entend (le son est joué à la position du tireur)
+    BroadcastEvent(EV_SHOT, pkt->player_id, 0, (int)shooter->weapon[shooter->slot]);
 
     V3 o = {pkt->ox, pkt->oy, pkt->oz};
     V3 d = {pkt->dx, pkt->dy, pkt->dz};
@@ -514,6 +671,7 @@ static void ApplyInputs(Player *p, const PacketClientInput *pkt)
         if (m2 > 1.0f) { float inv = 1.0f / sqrtf(m2); c.move_x *= inv; c.move_y *= inv; }
 
         c.speed_mult = WEAPONS[p->weapon[p->slot]].move_mult;   // arme lourde ou légère
+        p->use = c.use;
         PlayerStep(&p->sim, &c, dt);
         p->yaw = e->yaw;
         p->pitch = e->pitch;
@@ -597,6 +755,14 @@ static void SendSnapshot(void)
     snap.round_phase = (uint8_t)round_phase;
     snap.round_winner = (uint8_t)round_winner;
     snap.round_time = round_timer > 0.0f ? round_timer : 0.0f;
+    snap.bomb_state = (uint8_t)bomb_state;
+    snap.bomb_carrier = (uint8_t)(bomb_carrier >= 0 ? bomb_carrier : 255);
+    snap.bomb_site = (uint8_t)bomb_site;
+    snap.bomb_actor = (uint8_t)(bomb_actor >= 0 ? bomb_actor : 255);
+    snap.bomb_x = bomb_pos.x; snap.bomb_y = bomb_pos.y; snap.bomb_z = bomb_pos.z;
+    snap.bomb_timer = bomb_timer > 0.0f ? bomb_timer : 0.0f;
+    snap.bomb_progress = (bomb_state == BOMB_CARRIED) ? bomb_progress / BOMB_PLANT_TIME
+                       : (bomb_state == BOMB_PLANTED) ? bomb_progress / BOMB_DEFUSE_TIME : 0.0f;
 
     for (int i = 0; i < MAX_PLAYERS; i++) {
         Player *p = &players[i];
@@ -606,7 +772,7 @@ static void SendSnapshot(void)
         if (!p->active) continue;
         s->team = (uint8_t)p->team;
         s->alive = p->alive ? 1 : 0;
-        s->is_bot = p->is_bot ? 1 : 0;
+        s->is_bot = (uint8_t)p->is_bot;
         s->spawn_count = p->spawn_count;
         s->health = (int16_t)p->health;
         s->kills = (uint16_t)p->kills;

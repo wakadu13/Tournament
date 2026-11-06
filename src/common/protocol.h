@@ -15,7 +15,11 @@
 // arme de poing), change d'arme et recharge par PKT_CL_WEAPON ; le serveur
 // tient les chargeurs et les reserves, applique degats, cadence, portee et
 // plombs de l'arme ACTIVE, et relaie l'arme de chacun dans le snapshot.
-#define PROTO_VERSION   4
+// v5 : mode bombe. Un T porte la bombe, la pose sur un site (touche
+// d'action, INPUT_USE), les CT la desamorcent ; le snapshot porte l'etat
+// de la bombe. Les bots peuvent etre des SOLDATS armes (is_bot = 2). Le
+// serveur diffuse chaque tir (EV_SHOT) pour que les clients l'entendent.
+#define PROTO_VERSION   5
 #define DEFAULT_PORT    7777
 
 #define MAX_PLAYERS     16
@@ -27,6 +31,7 @@
 #define INPUT_JUMP      0x01
 #define INPUT_SPRINT    0x02
 #define INPUT_ADS       0x04
+#define INPUT_USE       0x08    // action maintenue : poser / desamorcer la bombe
 
 // Compensation de lag
 #define HISTORY_TICKS   64      // positions gardees par le serveur (~1 s a 60 Hz)
@@ -72,7 +77,39 @@ typedef enum {
     EV_ROUND_START,     // a = numéro de manche
     EV_ROUND_END,       // a = équipe gagnante (TEAM_COUNT = manche nulle), b = numéro
     EV_LOADOUT,         // a = joueur, value = 1 si applique tout de suite, 0 si a la prochaine manche
+    EV_SHOT,            // a = tireur, value = arme : un tir accepte par le serveur (pour le son)
+    EV_BOMB_PLANTED,    // a = poseur, b = site (0 = A, 1 = B)
+    EV_BOMB_DEFUSED,    // a = desamorceur
+    EV_BOMB_EXPLODED,   // b = site
+    EV_BOMB_DROPPED,    // a = joueur qui la portait
+    EV_BOMB_PICKED,     // a = joueur qui la ramasse
 } EventType;
+
+// Pourquoi la manche s'est finie (value de EV_ROUND_END)
+typedef enum {
+    RE_ELIMINATION = 0, // plus de survivant dans une equipe
+    RE_TIME,            // temps ecoule
+    RE_EXPLODED,        // la bombe a explose
+    RE_DEFUSED,         // la bombe a ete desamorcee
+    RE_DRAW,            // nulle
+} RoundEndReason;
+
+// Etat de la bombe
+typedef enum {
+    BOMB_NONE = 0,      // pas de bombe cette manche (aucun T capable de la porter)
+    BOMB_CARRIED,       // portee par bomb_carrier
+    BOMB_DROPPED,       // au sol, a ramasser par un T
+    BOMB_PLANTED,       // posee : bomb_timer compte a rebours
+    BOMB_DEFUSED,
+    BOMB_EXPLODED,
+} BombState;
+
+// Types de joueurs (PacketConnect.is_bot, relaye dans le snapshot)
+typedef enum {
+    BOT_NONE = 0,       // joueur humain
+    BOT_ZOMBIE,         // poussin zombie : griffes, fonce sur sa proie
+    BOT_SOLDIER,        // soldat arme : vise, tire, recharge, pose et desamorce
+} BotKind;
 
 // Phase de la manche en cours
 typedef enum {
@@ -126,7 +163,7 @@ typedef struct {
 typedef struct {
     uint8_t type;           // PKT_CL_CONNECT
     uint8_t version;        // PROTO_VERSION
-    uint8_t is_bot;         // 1 = bot zombie, 0 = joueur humain
+    uint8_t is_bot;         // BotKind
     char    name[NAME_MAX];
 } PacketConnect;
 
@@ -200,7 +237,7 @@ typedef struct {
     uint8_t  active;        // 1 si le slot est occupé
     uint8_t  team;
     uint8_t  alive;
-    uint8_t  is_bot;        // 1 = zombie (poussin), 0 = humain (soldat)
+    uint8_t  is_bot;        // BotKind : 1 = zombie (poussin), 0 ou 2 = soldat
     uint8_t  spawn_count;   // +1 à chaque respawn (voir PacketClientState)
     int16_t  health;
     uint16_t kills;
@@ -235,6 +272,14 @@ typedef struct {
     uint8_t        round_phase;     // RoundPhase
     uint8_t        round_winner;    // en ROUND_END : équipe gagnante, TEAM_COUNT = nulle
     float          round_time;      // secondes restantes (PLAY) ou avant la suivante (END)
+    // La bombe
+    uint8_t        bomb_state;      // BombState
+    uint8_t        bomb_carrier;    // id du porteur (CARRIED)
+    uint8_t        bomb_site;       // 0 = A, 1 = B (PLANTED)
+    uint8_t        bomb_actor;      // joueur en train de poser ou de desamorcer, 255 = personne
+    float          bomb_x, bomb_y, bomb_z;   // position (DROPPED, PLANTED)
+    float          bomb_timer;      // secondes avant l'explosion (PLANTED)
+    float          bomb_progress;   // 0..1 : avancement de la pose ou du desamorcage
     SnapshotPlayer players[MAX_PLAYERS];
 } PacketSnapshot;
 

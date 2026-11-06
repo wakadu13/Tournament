@@ -22,6 +22,7 @@ typedef struct {
     bool  fullscreen;      // PC : plein écran
     bool  show_fps;
     bool  auto_reload;     // recharge seul quand le chargeur est vide
+    float volume;          // volume général, 0 .. 1
     int   primary;         // WeaponId de l'arme principale choisie
     int   secondary;       // WeaponId de l'arme de poing choisie
     char  name[16];        // pseudo (NAME_MAX)

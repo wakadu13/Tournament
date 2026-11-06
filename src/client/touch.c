@@ -47,7 +47,7 @@ void TouchSetAmmoLabel(const char *text) { (void)text; }
 #define SPRINT_PUSH   0.85f    // joystick poussé au-delà = sprint
 
 // Rôle d'un doigt, choisi à l'endroit où il se pose
-typedef enum { TR_NONE, TR_JOY, TR_LOOK, TR_FIRE, TR_AIM, TR_JUMP, TR_RELOAD, TR_SWAP, TR_MENU, TR_COUNT } TouchRole;
+typedef enum { TR_NONE, TR_JOY, TR_LOOK, TR_FIRE, TR_AIM, TR_JUMP, TR_RELOAD, TR_SWAP, TR_MENU, TR_USE, TR_COUNT } TouchRole;
 
 // Un doigt suivi d'une image à l'autre
 typedef struct {
@@ -80,7 +80,7 @@ static char    ammo_label[24] = "ARME";     // texte du bouton de changement d'a
 // trois boutons occupe ~90 unités du bord droit et chevauchait TIRER.
 // RECHARGER et ARME (changement) complètent la grappe ; MENU est en haut
 // à gauche, hors de la zone du joystick (qui commence à 22 % de la hauteur).
-#define BUTTON_MAX 6
+#define BUTTON_MAX 7
 static int Buttons(Button *b)
 {
     int n = 0;
@@ -90,6 +90,7 @@ static int Buttons(Button *b)
     b[n++] = (Button){ TR_RELOAD, { vw - 250.0f, vh - 190.0f }, 34 };
     b[n++] = (Button){ TR_SWAP,   { vw - 108.0f, vh - 330.0f }, 32 };
     b[n++] = (Button){ TR_MENU,   { 44.0f, 44.0f }, 26 };
+    b[n++] = (Button){ TR_USE,    { vw - 250.0f, vh - 290.0f }, 30 };   // BOMBE : maintenu
     return n;
 }
 
@@ -228,6 +229,7 @@ void TouchUpdate(float ui_scale, float screen_w, float screen_h)
         case TR_RELOAD:
         case TR_SWAP:
         case TR_MENU:
+        case TR_USE:
             held[f->role] = true;
             break;
         default:
@@ -258,6 +260,7 @@ void TouchApply(PlayerInput *in, float ads)
     if (pressed[TR_RELOAD]) in->reload = true;
     if (pressed[TR_SWAP])   in->swap = true;
     if (pressed[TR_MENU])   in->menu = true;
+    if (held[TR_USE])       in->use = true;
     if (aim_toggle)    in->aim = true;
     // Sprint : joystick poussé à fond vers l'avant
     if (joy.y > SPRINT_PUSH) in->sprint = true;
@@ -287,8 +290,9 @@ void TouchDraw(void)
                           : (b[i].role == TR_AIM)    ? "VISER"
                           : (b[i].role == TR_JUMP)   ? "SAUT"
                           : (b[i].role == TR_RELOAD) ? "RECH."
+                          : (b[i].role == TR_USE)    ? "BOMBE"
                           : (b[i].role == TR_SWAP)   ? ammo_label : "MENU";
-        int size = (b[i].role == TR_FIRE) ? 20 : (b[i].role == TR_SWAP ? 13 : 16);
+        int size = (b[i].role == TR_FIRE) ? 20 : (b[i].role == TR_SWAP || b[i].role == TR_USE ? 13 : 16);
         DrawText(label, (int)b[i].c.x - MeasureText(label, size) / 2,
                  (int)b[i].c.y - size / 2, size, Fade(RAYWHITE, 0.85f));
     }

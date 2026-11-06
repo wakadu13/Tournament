@@ -18,6 +18,14 @@
 #define ROUND_TIME          120.0f  // durée maximale d'une manche (s) : au-delà,
                                     // l'équipe avec le plus de survivants l'emporte
 #define ROUND_END_DELAY     4.0f    // pause entre deux manches (s)
+// La bombe (les BLEUS / T l'attaquent, les ROUGES / CT la defendent)
+#define BOMB_PLANT_TIME     4.0f    // s a rester immobile sur un site pour la poser
+#define BOMB_DEFUSE_TIME    10.0f   // s pour la desamorcer
+#define BOMB_TIMER          40.0f   // s entre la pose et l'explosion
+#define BOMB_RADIUS         16.0f   // m : rayon des degats
+#define BOMB_DAMAGE         220     // degats au centre, decroissants jusqu'au bord
+#define BOMB_USE_RANGE      2.0f    // m : distance pour ramasser / desamorcer
+#define BOMB_TEAM           TEAM_BLUE   // l'equipe qui attaque
 
 #define PLAYER_SPEED        7.0f    // m/s
 #define SPRINT_SPEED        10.5f   // m/s en sprint
@@ -72,6 +80,13 @@ void MapInit(void);
 
 #define SPAWNS_PER_TEAM 5
 extern const V3 TEAM_SPAWNS[TEAM_COUNT][SPAWNS_PER_TEAM];
+
+// Les deux sites de bombe (A au nord-est, B au nord-ouest), et le nœud de
+// passage des bots au cœur de chacun.
+#define BOMB_SITE_COUNT 2
+extern const Box BOMB_SITES[BOMB_SITE_COUNT];
+extern const int BOMB_SITE_NODE[BOMB_SITE_COUNT];
+int BombSiteAt(V3 pos);     // 0 = A, 1 = B, -1 = hors site
 
 // Points de passage pour les bots : les centres des couloirs et des sites,
 // relies entre eux quand on peut marcher droit de l'un a l'autre.
@@ -128,6 +143,7 @@ typedef struct {
     float move_x, move_y;   // -1..1, longueur <= 1 (droite, avant)
     float yaw;              // orientation de la vue (le déplacement est à plat)
     bool  jump, sprint, ads;
+    bool  use;              // action maintenue (bombe) : sans effet sur le mouvement
     float speed_mult;       // vitesse de l'arme tenue (WeaponStats.move_mult) ; 0 = 1
 } PlayerCmd;
 

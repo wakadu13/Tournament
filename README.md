@@ -14,15 +14,37 @@ PAMAS G1) à choisir dans le **menu d'équipement**, et un **menu d'options**
   corps reste au sol).
 - L'équipe qui **n'a plus aucun survivant perd la manche**. Si les deux
   derniers tombent en même temps, la manche est nulle.
-- Une manche dure au plus **2 minutes** (`ROUND_TIME`) : au temps, l'équipe
-  qui a le plus de survivants l'emporte ; à égalité, manche nulle.
+- Une manche dure au plus **2 minutes** (`ROUND_TIME`).
 - Le match se joue en **5 manches gagnantes** (`ROUNDS_TO_WIN`), avec 4 s de
   pause entre deux manches.
 - Un joueur qui arrive **en cours de manche** attend la suivante, éliminé
   d'office. S'il manque une équipe, le serveur attend.
 
+### La bombe
+
+Comme sur Dust 2, les **bleus (T) attaquent** et les **rouges (CT)
+défendent** :
+
+- Au début de la manche, un T tiré au sort **porte la bombe** (visible
+  sur son dos). S'il meurt, elle tombe au sol ; un autre T la ramasse en
+  passant dessus.
+- Sur un **site** (A au nord-est, B au nord-ouest), le porteur la **pose**
+  en restant immobile et en maintenant **E** (le bouton **BOMBE** sur
+  Android) pendant 4 s. Elle explose **40 s** plus tard : 220 dégâts au
+  centre, décroissants jusqu'à 16 m, pour tout le monde.
+- Un CT la **désamorce** de la même façon, à moins de 2 m, en 10 s.
+- La manche se gagne par **explosion** (T), **désamorçage** (CT),
+  **élimination** de l'équipe adverse, ou au **temps** (CT, si la bombe
+  n'est pas posée). Une fois posée, la manche continue jusqu'à l'explosion
+  ou au désamorçage, même sans T vivant.
+- Sans T capable de la porter (une équipe de poussins zombies), la manche
+  se joue sans bombe : au temps, l'équipe avec le plus de survivants.
+
 Le HUD affiche les manches gagnées de chaque côté, le numéro de manche et
-le chrono au centre, et un point par survivant sous chaque score.
+le chrono au centre, un point par survivant sous chaque score, et tout ce
+qui concerne la bombe : qui la porte, la distance au site, ce qu'il faut
+faire, la progression de la pose ou du désamorçage, le compte à rebours.
+La bombe posée **bipe** de plus en plus vite.
 
 ## La carte
 
@@ -65,11 +87,11 @@ sont dégagés, que le graphe est connexe, que les escaliers se montent,
 que les portes se passent et que les fenêtres arrêtent les joueurs mais
 pas les balles.
 
-Les joueurs humains incarnent des **soldats-mercenaires** (treillis olive,
-visage peint en vert, yeux injectés de sang, démarche bras tendus) ; les
-bots sont des **poussins zombies** humanoïdes ensanglantés, tout droit
-sortis d'un film d'horreur. Épaulettes, brassards et colliers prennent la
-couleur de l'équipe.
+Les joueurs humains et les bots soldats incarnent des
+**soldats-mercenaires** (treillis olive, visage peint en vert, yeux
+injectés de sang, l'arme épaulée) ; les bots zombies sont des **poussins
+zombies** humanoïdes ensanglantés, tout droit sortis d'un film d'horreur.
+Épaulettes, brassards et colliers prennent la couleur de l'équipe.
 
 ## Les armes
 
@@ -129,6 +151,8 @@ src/
 ├── client/menu.c     Accueil, pause, équipement, options
 ├── client/ui.c       Widgets immédiats (boutons, curseurs, champs, clavier à l'écran)
 ├── client/options.c  Réglages persistants (options.cfg)
+├── client/textures.c Textures procédurales de la carte
+├── client/sound.c    Sons synthétisés
 ├── client/touch.c    Commandes tactiles (Android)
 └── bot/main.c        Bot zombie headless (pour le dev et le test)
 
@@ -221,6 +245,37 @@ Comme le CPU tient les sommets, l'ombrage est **cuit dans la couleur** de
 chacun (70 % d'ambiance, 30 % selon l'angle entre la normale et la lumière)
 : du relief là où tout était plat, sans shader, pour un coût nul au rendu.
 Hors d'un lot, les primitives se dessinent une à une comme avant.
+
+### Textures procédurales
+
+La carte est texturée sans qu'aucune image ne soit chargée : sable, pisé,
+bois, pierre, tôle, toile et tuiles sont **générés au démarrage**
+([src/client/textures.c](src/client/textures.c)) par du bruit de valeur à
+plusieurs octaves, des rayures, des joints et des fissures, en 256 × 256
+avec mipmaps, et se répètent sans couture. Le lot de rendu tient **un
+tampon par matériau** : les coordonnées de texture sont projetées sur
+chaque face selon l'axe dominant de sa normale (en mètres, divisés par
+l'échelle du matériau), si bien qu'une boîte de n'importe quelle taille se
+texture sans étirement. La teinte de chaque genre d'objet (bois sombre
+d'un battant de porte, bois clair d'une caisse, tôle verdie d'un tonneau)
+multiplie la texture. Les personnages et les armes restent en couleur
+seule. Une dizaine d'appels de dessin par image pour toute la scène.
+
+### Sons synthétisés
+
+Pas de fichier audio non plus : chaque son est **synthétisé au démarrage**
+([src/client/sound.c](src/client/sound.c)) à partir de bruit blanc, de
+sinusoïdes glissantes, d'enveloppes exponentielles, d'un passe-bas et
+d'une saturation douce. Un timbre de tir par famille d'arme (fusil
+d'assaut, pistolet-mitrailleur, pistolet, fusil à pompe, fusil de
+précision), la griffe du poussin, le chargeur qui sort et qui rentre, le
+clic à vide, le tic du coup au but, le choc encaissé, les pas, la réception
+d'un saut, les piaillements des poussins zombies qui rôdent, le bip de la
+bombe, sa pose, son désamorçage, l'explosion, et les jingles de manche.
+Le serveur diffuse chaque tir accepté (`EV_SHOT`) : on entend les autres
+tirer **d'où ils sont**, atténués avec la distance et répartis à gauche ou
+à droite. Le volume se règle dans les options ; sans carte son, tout
+reste muet sans erreur.
 
 ### Ce qui bouge sur un poussin zombie
 
@@ -357,8 +412,9 @@ machine sans affichage.
 # Terminal 2 : votre client
 ./build/client 127.0.0.1 Alice
 
-# Terminal 3 : un bot zombie pour avoir un adversaire (dev/test)
-./build/bot 127.0.0.1 Zombie
+# Terminal 3 : un bot pour avoir un adversaire
+./build/bot 127.0.0.1 Zombie            # un poussin zombie (griffes)
+./build/bot 127.0.0.1 Rambo soldat 2    # un soldat armé, adresse 0 (maladroit) à 3 (redoutable)
 ```
 
 Le client et le bot prennent `hôte[:port]` : une IP comme un **nom DNS**,
@@ -373,12 +429,26 @@ avec un port facultatif collé à l'adresse.
 L'équipe est attribuée automatiquement (auto-équilibrage) : connectez le
 bot **après** vous pour qu'il soit dans l'équipe adverse.
 
-### Le bot zombie
+### Les bots
 
-Headless, il chasse l'ennemi vivant le plus proche, contourne (grossièrement)
-les obstacles en sautant et en faisant des pas de côté quand il est coincé,
-et griffe au corps-à-corps (25 dégâts toutes les 0,9 s). Ses réglages sont en
-tête de [src/bot/main.c](src/bot/main.c).
+Headless, ils parlent au serveur exactement comme un client (même
+protocole), ce qui permet de jouer seul ou de tester.
+
+- Le **poussin zombie** chasse l'ennemi vivant le plus proche, suit les
+  points de passage quand il ne le voit pas, saute et fait des pas de côté
+  quand il est coincé, et griffe au corps-à-corps (25 dégâts toutes les
+  0,9 s).
+- Le **soldat** (`soldat`, puis une adresse de 0 à 3) choisit une arme au
+  hasard, et dès qu'il voit un ennemi il le **vise** (avec une erreur qui
+  grandit avec la distance et diminue avec son adresse), **tire** selon le
+  mode de son arme (rafales de 3 à 6 coups pour les automatiques, coup par
+  coup sinon), **recharge** à vide, passe au pistolet sans réserve, et
+  garde la **distance** qui convient à son arme (7 m au fusil à pompe,
+  35 m au FR-F2) en avançant, reculant ou se décalant. En équipe T, il
+  porte la bombe jusqu'au site le plus proche et la pose ; en CT, il court
+  la désamorcer. Un ennemi en vue passe avant tout le reste.
+
+Leurs réglages sont en tête de [src/bot/main.c](src/bot/main.c).
 
 ## Serveur dédié sur Linux
 
@@ -595,8 +665,8 @@ les caractéristiques et un aperçu 3D de chaque arme), **OPTIONS**,
 options, quitter la partie) et **B** ouvre directement l'équipement.
 
 Les options : sensibilité souris, sensibilité au doigt (Android), champ
-de vision (60 à 100°), inversion de l'axe vertical, plein écran (PC),
-affichage des FPS, rechargement automatique. Avec le dernier serveur, le
+de vision (60 à 100°), volume, inversion de l'axe vertical, plein écran
+(PC), affichage des FPS, rechargement automatique. Avec le dernier serveur, le
 pseudo et l'équipement choisi, elles sont écrites dans **`options.cfg`**
 (texte `clé=valeur`), à côté de l'exécutable sur PC et dans le dossier
 privé de l'application sur Android. Un fichier absent ou abîmé donne
@@ -614,6 +684,7 @@ directement (pratique pour les scripts et les tests).
 | Clic gauche | Tirer (maintenu pour les armes automatiques, un clic par coup sinon) |
 | Clic droit | Viser (zoom ; lunette avec le FR-F2) |
 | R | Recharger |
+| E (maintenu) | Poser la bombe sur un site / la désamorcer |
 | 1 / 2, molette | Arme principale / arme de poing |
 | B | Choisir son équipement |
 | Maj gauche | Sprint (en avançant) |
@@ -639,8 +710,9 @@ deux points (tout est derrière `MOBILE_UI` dans
   - partout ailleurs : **glisser pour viser** ;
   - boutons ronds en bas à droite : **TIRER** (on peut viser en glissant
     depuis ce bouton, donc tirer et viser du même pouce), **VISER**
-    (bascule), **SAUT**, **RECH.** (recharger) et le bouton d'arme, qui
-    affiche les munitions de l'arme en main et **change d'arme** ;
+    (bascule), **SAUT**, **RECH.** (recharger), **BOMBE** (maintenu :
+    poser ou désamorcer) et le bouton d'arme, qui affiche les munitions
+    de l'arme en main et **change d'arme** ;
   - en haut à gauche : **MENU** (pause, armes, options).
 
   Chaque doigt reçoit un rôle au moment où il se pose et le garde jusqu'à ce
@@ -670,8 +742,8 @@ de [src/client/main.c](src/client/main.c).
 
 ## Pistes pour la suite
 
-- Sons (tirs, hits, cris de poussin)
 - Chat texte
-- Grenades, et un vrai pathfinding pour les bots (aujourd'hui : points de passage)
+- Grenades, économie d'achat par manche, et un vrai pathfinding pour les
+  bots (aujourd'hui : points de passage)
 - Delta-compression des snapshots, pour dépasser 16 joueurs
 - Signature de release de l'APK (aujourd'hui signé avec la clé de debug)

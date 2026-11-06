@@ -414,6 +414,23 @@ const NavNode NAV_NODES[] = {
 };
 const int NAV_NODE_COUNT = (int)(sizeof(NAV_NODES) / sizeof(NAV_NODES[0]));
 
+// Les sites de bombe : la zone au sol où un T peut poser
+const Box BOMB_SITES[BOMB_SITE_COUNT] = {
+    {{ 34, 0, -58}, { 58, 4, -24}, K_WALL},   // A : nord-est
+    {{-58, 0, -58}, {-34, 4, -24}, K_WALL},   // B : nord-ouest
+};
+const int BOMB_SITE_NODE[BOMB_SITE_COUNT] = { 18, 9 };
+
+int BombSiteAt(V3 pos)
+{
+    for (int i = 0; i < BOMB_SITE_COUNT; i++) {
+        const Box *b = &BOMB_SITES[i];
+        if (pos.x >= b->min.x && pos.x <= b->max.x && pos.z >= b->min.z && pos.z <= b->max.z
+            && pos.y >= b->min.y && pos.y <= b->max.y) return i;
+    }
+    return -1;
+}
+
 // --- Les armes --------------------------------------------------------------
 // Dégâts par balle (100 PV), cadence en secondes par coup, portée en mètres.
 // Les fusils d'assaut tuent en 4 balles au corps, 2 à la tête ; le FR-F2
@@ -532,6 +549,7 @@ PlayerCmd CmdFromEntry(const InputEntry *e)
     c.jump   = (e->flags & INPUT_JUMP) != 0;
     c.sprint = (e->flags & INPUT_SPRINT) != 0;
     c.ads    = (e->flags & INPUT_ADS) != 0;
+    c.use    = (e->flags & INPUT_USE) != 0;
     c.speed_mult = 1.0f;
     return c;
 }

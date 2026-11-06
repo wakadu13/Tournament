@@ -46,7 +46,7 @@ RAYLIB_MODULES="rcore rshapes rtextures rtext rmodels raudio utils"
 
 # Les sources du client : son propre code + les regles partagees.
 # Surtout PAS src/server/main.c ni src/bot/main.c, qui ont leur propre main().
-GAME_SRC="src/client/main.c src/client/models.c src/client/weapons.c src/client/touch.c src/client/ui.c src/client/menu.c src/client/options.c src/common/game.c"
+GAME_SRC="src/client/main.c src/client/models.c src/client/weapons.c src/client/touch.c src/client/ui.c src/client/menu.c src/client/options.c src/client/textures.c src/client/sound.c src/common/game.c"
 
 for ABI in arm64-v8a x86_64; do
     case $ABI in

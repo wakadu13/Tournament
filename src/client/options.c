@@ -37,6 +37,7 @@ void OptionsDefaults(void)
     options.fullscreen = false;
     options.show_fps = true;
     options.auto_reload = true;
+    options.volume = 0.8f;
     options.primary = WPN_FAMAS;
     options.secondary = WPN_GLOCK;
     snprintf(options.name, sizeof(options.name), "Joueur");
@@ -55,6 +56,7 @@ static void Apply(const char *key, const char *val)
     else if (!strcmp(key, "fullscreen")) options.fullscreen = atoi(val) != 0;
     else if (!strcmp(key, "show_fps")) options.show_fps = atoi(val) != 0;
     else if (!strcmp(key, "auto_reload")) options.auto_reload = atoi(val) != 0;
+    else if (!strcmp(key, "volume"))   options.volume = ClampF((float)atof(val), 0.0f, 1.0f);
     else if (!strcmp(key, "primary")) {
         int w = atoi(val);
         if (w >= WPN_FAMAS && w <= WPN_BENELLI) options.primary = w;
@@ -105,13 +107,14 @@ bool OptionsSave(void)
              "fullscreen=%d\n"
              "show_fps=%d\n"
              "auto_reload=%d\n"
+             "volume=%.2f\n"
              "primary=%d\n"
              "secondary=%d\n"
              "name=%s\n"
              "server=%s\n",
              options.sensitivity, options.touch_sens, options.fov,
              options.invert_y ? 1 : 0, options.fullscreen ? 1 : 0,
-             options.show_fps ? 1 : 0, options.auto_reload ? 1 : 0,
+             options.show_fps ? 1 : 0, options.auto_reload ? 1 : 0, options.volume,
              options.primary, options.secondary, options.name, options.server);
     return SaveFileText(OptionsPath(), text);
 }

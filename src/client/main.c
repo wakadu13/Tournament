@@ -44,6 +44,8 @@
 #include "../common/protocol.h"
 #include "../common/game.h"
 #include "models.h"   // modèles 3D des personnages (soldat / poussin zombie)
+#include "textures.h" // textures procédurales de la carte
+#include "sound.h"    // sons synthétisés
 #include "weapons.h"  // modèles 3D des armes
 #include "touch.h"    // commandes tactiles (mobile) et structure PlayerInput
 #include "options.h"  // réglages persistants (options.cfg)
@@ -243,6 +245,19 @@ static char     weapon_msg[96] = "";         // « équipement appliqué » ...
 static float    weapon_msg_t = 0.0f;
 static bool     scoped = false;              // dans la lunette (FR-F2 en visée)
 
+// --- La bombe, et ce qu'on en montre ---
+static float   explosion_t = 0.0f;        // 1 -> 0 : l'explosion en cours (boule, flash)
+static Vector3 explosion_pos;
+static float   beep_t = 0.0f;             // prochain bip de la bombe posée
+static float   use_tick_t = 0.0f;         // prochain tic pendant qu'on pose / désamorce
+static int     round_end_reason = RE_ELIMINATION;
+
+// --- Sons de pas ---
+static int   last_step = 0;               // numéro du dernier pas joué (local)
+static bool  was_on_ground = true;
+static float last_vel_y = 0.0f;
+static int   other_step[MAX_PLAYERS];     // idem pour chaque autre joueur
+
 // Menu ouvert en jeu (pause, armes, options) ; MENU_NONE = on joue
 static MenuScreen menu = MENU_NONE;
 static bool       quit_requested = false;
@@ -419,9 +434,12 @@ static void HandleEvent(const PacketEvent *ev)
     case EV_KILL: {
         int w = ev->value & 0xFF;
         bool head = (ev->value & 0x100) != 0;
-        snprintf(line, sizeof(line), "%s a éliminé %s (%s%s)",
-                 PlayerName(ev->a), PlayerName(ev->b),
-                 (w >= 0 && w < WPN_COUNT) ? WEAPONS[w].name : "?", head ? ", tête" : "");
+        if (w == WPN_COUNT)
+            snprintf(line, sizeof(line), "%s a été soufflé par la bombe", PlayerName(ev->b));
+        else
+            snprintf(line, sizeof(line), "%s a éliminé %s (%s%s)",
+                     PlayerName(ev->a), PlayerName(ev->b),
+                     (w >= 0 && w < WPN_COUNT) ? WEAPONS[w].name : "?", head ? ", tête" : "");
         KillfeedPush(line);
     }
         if (ev->a == my_id) hit_marker_timer = 0.3f;   // c'est nous le tueur
@@ -430,8 +448,8 @@ static void HandleEvent(const PacketEvent *ev)
         if (ev->a < MAX_PLAYERS) CharAnimAttack(&anim[ev->a]);
         break;
     case EV_HIT:
-        if (ev->a == my_id) hit_marker_timer = 0.15f;  // on a touché quelqu'un
-        if (ev->b == my_id) damage_flash_timer = 0.25f; // on a été touché
+        if (ev->a == my_id && ev->b != my_id) { hit_marker_timer = 0.15f; SoundPlay(SND_HITMARK, 0.6f, 1.0f); }
+        if (ev->b == my_id) { damage_flash_timer = 0.25f; SoundPlay(SND_HURT, 0.9f, 1.0f); }
         // Celui qui frappe porte son coup (pour un bot : le bond de griffe,
         // bec qui claque) et celui qui encaisse sursaute.
         if (ev->a < MAX_PLAYERS) CharAnimAttack(&anim[ev->a]);
@@ -445,13 +463,51 @@ static void HandleEvent(const PacketEvent *ev)
     case EV_ROUND_START:
         snprintf(line, sizeof(line), "Manche %d", ev->a);
         KillfeedPush(line);
+        SoundPlay(SND_ROUND_START, 0.7f, 1.0f);
         break;
     case EV_ROUND_END:
-        if (ev->a < TEAM_COUNT)
+        round_end_reason = ev->value;
+        if (ev->a < TEAM_COUNT) {
             snprintf(line, sizeof(line), "Manche %d : %s l'emporte", ev->b,
                      ev->a == TEAM_RED ? "ROUGE" : "BLEU");
-        else
+            SoundPlay(ev->a == my_team ? SND_WIN : SND_LOSE, 0.7f, 1.0f);
+        } else
             snprintf(line, sizeof(line), "Manche %d : nulle", ev->b);
+        KillfeedPush(line);
+        break;
+    case EV_MATCH_OVER:
+        SoundPlay(ev->a == my_team ? SND_WIN : SND_LOSE, 0.9f, 0.8f);
+        break;
+    case EV_SHOT:
+        // Le tir d'un autre : on l'entend d'où il est (le nôtre est joué
+        // tout de suite dans Shoot, sans attendre le serveur)
+        if (ev->a != my_id && ev->a < MAX_PLAYERS && has_display[ev->a]) {
+            Vector3 at = {display_pos[ev->a].x, display_pos[ev->a].y + PLAYER_EYE_HEIGHT, display_pos[ev->a].z};
+            SoundPlayAt(SoundForWeapon(ev->value), at, 1.0f, ev->value == WPN_CLAWS ? 30.0f : 120.0f);
+        }
+        break;
+    case EV_BOMB_PLANTED:
+        snprintf(line, sizeof(line), "%s a posé la bombe sur le site %c", PlayerName(ev->a), 'A' + ev->b);
+        KillfeedPush(line);
+        SoundPlay(SND_PLANT, 0.8f, 1.0f);
+        beep_t = 0.0f;
+        break;
+    case EV_BOMB_DEFUSED:
+        snprintf(line, sizeof(line), "%s a désamorcé la bombe", PlayerName(ev->a));
+        KillfeedPush(line);
+        SoundPlay(SND_DEFUSE, 0.8f, 1.0f);
+        break;
+    case EV_BOMB_EXPLODED:
+        KillfeedPush("La bombe a explosé");
+        explosion_t = 1.0f;
+        explosion_pos = (Vector3){snap.bomb_x, snap.bomb_y, snap.bomb_z};
+        SoundPlayAt(SND_EXPLOSION, explosion_pos, 1.0f, 400.0f);
+        break;
+    case EV_BOMB_DROPPED:
+        KillfeedPush("La bombe est au sol");
+        break;
+    case EV_BOMB_PICKED:
+        snprintf(line, sizeof(line), "%s porte la bombe", PlayerName(ev->a));
         KillfeedPush(line);
         break;
     case EV_PLAYER_JOIN:
@@ -672,6 +728,7 @@ static void Shoot(void)
     if (w->mag > 0 && my_mag[my_slot] > 0) my_mag[my_slot]--;   // en attendant le snapshot
     if (w->mode == FIRE_BOLT || w->mode == FIRE_PUMP) bolt_t = 1.0f;   // réarmement animé
     else if (w->mode == FIRE_SEMI) bolt_t = 0.6f;                      // glissière du pistolet
+    SoundPlay(SoundForWeapon(my_weapon[my_slot]), 1.0f, 0.96f + Randf(0, 0.08f));
 
     // Direction du tir = regard (recul compris) + dispersion aléatoire dans
     // un cône : on décale la direction dans le plan perpendiculaire (r, u).
@@ -714,6 +771,7 @@ static void SwitchWeapon(int slot)
     reload_t = 0.0f;
     bolt_t = 0.0f;
     NetSendWeapon(WA_SWITCH, slot, 0);
+    SoundPlay(SND_SWITCH, 0.7f, 1.0f);
 }
 
 static void StartReload(void)
@@ -724,6 +782,7 @@ static void StartReload(void)
     reload_total = w->reload;
     reload_t = w->reload + 0.05f;
     NetSendWeapon(WA_RELOAD, 0, 0);
+    SoundPlay(SND_RELOAD, 0.8f, 1.0f);
 }
 
 // Envoie l'équipement choisi dans les options ; le serveur dira s'il
@@ -759,6 +818,7 @@ static void UpdateLocalPlayer(float dt)
     in.fire_pressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     in.aim  = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
     in.reload = IsKeyPressed(KEY_R);
+    in.use = IsKeyDown(KEY_E);          // poser / désamorcer la bombe (maintenu)
     // Changement d'arme : molette, ou 1 / 2 (positions des touches)
     float wheel = GetMouseWheelMove();
     if (wheel != 0.0f) in.swap = true;
@@ -810,7 +870,8 @@ static void UpdateLocalPlayer(float dt)
     e.move_y = (int8_t)lroundf(move.y * 127.0f);
     e.flags = (uint8_t)((in.jump ? INPUT_JUMP : 0)
                       | (sprinting ? INPUT_SPRINT : 0)
-                      | ((aiming && !sprinting) ? INPUT_ADS : 0));
+                      | ((aiming && !sprinting) ? INPUT_ADS : 0)
+                      | (in.use ? INPUT_USE : 0));
     e.yaw = my_yaw;
     e.pitch = my_pitch;
     PlayerCmd cmd = CmdFromEntry(&e);
@@ -821,6 +882,15 @@ static void UpdateLocalPlayer(float dt)
     // Phase du balancement de marche : avance avec la vitesse au sol
     float hspeed = sqrtf(my_sim.vel.x * my_sim.vel.x + my_sim.vel.z * my_sim.vel.z);
     if (my_sim.on_ground) bob += dt * hspeed * 1.6f;
+    // Un pas par demi-période du balancement ; réception après une chute
+    int step_no = (int)floorf(bob / PI);
+    if (step_no != last_step && my_sim.on_ground && hspeed > 1.5f) {
+        last_step = step_no;
+        SoundPlay(SND_STEP, 0.35f + 0.25f * (hspeed / SPRINT_SPEED), 0.9f + Randf(0, 0.2f));
+    }
+    if (my_sim.on_ground && !was_on_ground && last_vel_y < -3.0f) SoundPlay(SND_LAND, 0.6f, 1.0f);
+    was_on_ground = my_sim.on_ground;
+    last_vel_y = my_sim.vel_y;
 
     // --- Tir : selon le mode de l'arme (automatique tant que le bouton est
     // maintenu, ou un coup par pression), à sa cadence, jamais pendant un
@@ -832,7 +902,10 @@ static void UpdateLocalPlayer(float dt)
     bool can_fire = !sprinting && shoot_cooldown <= 0.0f && reload_t <= 0.0f && switch_t <= 0.0f;
     if (trigger && can_fire) {
         if (w->mag == 0 || my_mag[my_slot] > 0) Shoot();
-        else if (options.auto_reload) StartReload();
+        else {
+            SoundPlay(SND_EMPTY, 0.6f, 1.0f);
+            if (options.auto_reload) StartReload();
+        }
     }
     // Chargeur vide et plus personne n'appuie : on recharge aussi
     if (options.auto_reload && w->mag > 0 && my_mag[my_slot] == 0 && my_reserve[my_slot] > 0
@@ -856,7 +929,25 @@ static void UpdateLocalPlayer(float dt)
 static void UpdateViewEffects(float dt)
 {
     kick = fmaxf(0, kick - dt * 12.0f);
-    if (reload_t > 0.0f) reload_t -= dt;
+    if (reload_t > 0.0f) {
+        reload_t -= dt;
+        if (reload_t <= 0.0f) SoundPlay(SND_SWITCH, 0.7f, 1.1f);   // chargeur rentré, arme armée
+    }
+    if (explosion_t > 0.0f) explosion_t = fmaxf(0, explosion_t - dt * 0.8f);
+    // La bombe posée bipe, de plus en plus vite
+    if (snap.bomb_state == BOMB_PLANTED) {
+        beep_t -= dt;
+        if (beep_t <= 0.0f) {
+            float t = snap.bomb_timer / BOMB_TIMER;
+            beep_t = 0.12f + 0.9f * t * t;
+            SoundPlayAt(SND_BEEP, (Vector3){snap.bomb_x, snap.bomb_y + 0.2f, snap.bomb_z}, 0.9f, 60.0f);
+        }
+    }
+    // Un tic toutes les demi-secondes pendant qu'ON pose ou désamorce
+    if (snap.bomb_actor == my_id && my_id >= 0) {
+        use_tick_t -= dt;
+        if (use_tick_t <= 0.0f) { use_tick_t = 0.5f; SoundPlay(SND_BEEP, 0.4f, 0.7f); }
+    } else use_tick_t = 0.0f;
     if (switch_t > 0.0f) switch_t -= dt;
     if (bolt_t > 0.0f) bolt_t = fmaxf(0, bolt_t - dt * 2.2f);
     if (weapon_msg_t > 0.0f) weapon_msg_t -= dt;
@@ -1021,6 +1112,18 @@ static void InterpolateOthers(float dt)
         // (allure, foulée, saut, atterrissage) et de l'état vivant/mort :
         // le client n'a aucune donnée d'animation à recevoir du serveur.
         CharAnimUpdate(&anim[i], dt, before, display_pos[i], sp->alive != 0);
+
+        // Ses pas (une fois par demi-période de sa foulée), et les
+        // piaillements d'un poussin zombie qui rôde
+        if (sp->alive) {
+            int step_no = (int)floorf(anim[i].phase / PI);
+            if (step_no != other_step[i]) {
+                other_step[i] = step_no;
+                if (anim[i].move > 0.3f) SoundPlayAt(SND_STEP, display_pos[i], 0.5f, 25.0f);
+            }
+            if (sp->is_bot == BOT_ZOMBIE && Randf(0, 1) < dt * 0.12f)
+                SoundPlayAt(SND_CHIRP, (Vector3){display_pos[i].x, display_pos[i].y + 1.3f, display_pos[i].z}, 0.7f, 35.0f);
+        }
     }
 
     UpdateLookTargets();   // et chacun tourne la tête vers sa proie
@@ -1087,11 +1190,35 @@ static void DrawMapBox(const Box *b)
         [K_AWNING]  = {196,  70,  58, 255},   // toile rouge
         [K_CLOTH]   = {110,  60,  50, 255},   // tapis bordeaux
     };
+    // Matériau (texture) et teinte par genre : la texture donne la matière,
+    // la teinte la nuance (un battant de porte est du bois sombre, une
+    // caisse du bois clair ; un tonneau est de la tôle verdie)
+    static const int KIND_MATS[K_COUNT] = {
+        [K_WALL] = MAT_WALL, [K_CRATE] = MAT_WOOD, [K_BARREL] = MAT_METAL,
+        [K_SANDBAG] = MAT_CLOTH, [K_ROOF] = MAT_ROOF, [K_STEP] = MAT_STONE,
+        [K_WOOD] = MAT_WOOD, [K_STONE] = MAT_STONE, [K_METAL] = MAT_METAL,
+        [K_AWNING] = MAT_CLOTH, [K_CLOTH] = MAT_CLOTH,
+    };
+    static const Color KIND_TINTS[K_COUNT] = {
+        [K_WALL]    = {255, 250, 240, 255},
+        [K_CRATE]   = {255, 240, 215, 255},
+        [K_BARREL]  = {150, 175, 140, 255},
+        [K_SANDBAG] = {205, 195, 150, 255},
+        [K_ROOF]    = {255, 250, 245, 255},
+        [K_STEP]    = {240, 225, 200, 255},
+        [K_WOOD]    = {135,  95,  60, 255},
+        [K_STONE]   = {255, 252, 245, 255},
+        [K_METAL]   = {200, 205, 215, 255},
+        [K_AWNING]  = {235,  95,  75, 255},
+        [K_CLOTH]   = {165,  85,  70, 255},
+    };
+    (void)KIND_COLORS;
     Vector3 center = {(b->min.x + b->max.x) / 2, (b->min.y + b->max.y) / 2,
                       (b->min.z + b->max.z) / 2};
     Vector3 size = {b->max.x - b->min.x, b->max.y - b->min.y, b->max.z - b->min.z};
     int kind = (b->kind >= 0 && b->kind < K_COUNT) ? b->kind : K_WALL;
-    Color c = KIND_COLORS[kind];
+    Color c = KIND_TINTS[kind];
+    BatchSetMaterial(KIND_MATS[kind]);
     switch (kind) {
     case K_BARREL:
     case K_STONE:
@@ -1140,15 +1267,17 @@ static void DrawMapBox(const Box *b)
     // Contours : seulement sur les gros volumes (les petits décors en
     // auraient trop, pour rien)
     if (size.x * size.y * size.z > 0.5f)
-        DrawCubeWiresV(center, size, Shade(c, 0.55f));
+        DrawCubeWiresV(center, size, (Color){110, 90, 60, 90});
 }
 
 static void DrawMap(void)
 {
-    // Sol de l'arène : sable (la carte est inspirée de Dust)
-    DrawPlane((Vector3){0, 0, 0},
-              (Vector2){ARENA_HALF * 2, ARENA_HALF * 2},
-              (Color){186, 160, 112, 255});
+    // Sol de l'arène : une dalle de sable texturée (sa face du dessus est
+    // au niveau 0 ; le reste est sous terre)
+    BatchSetMaterial(MAT_SAND);
+    Box3(MatrixIdentity(), (Vector3){0, -0.5f, 0}, (Vector3){0, 0, 0},
+         (Vector3){ARENA_HALF * 2 + 2, 1.0f, ARENA_HALF * 2 + 2}, WHITE);
+    BatchSetMaterial(MAT_FLAT);
     // Quadrillage léger tous les 10 m (donne une échelle visuelle)
     for (int i = -(int)ARENA_HALF; i <= (int)ARENA_HALF; i += 10) {
         DrawLine3D((Vector3){(float)i, 0.01f, -ARENA_HALF},
@@ -1165,6 +1294,7 @@ static void DrawMap(void)
     // tas de sacs de sable un ellipsoïde.
     for (int i = 0; i < MAP_BOX_COUNT + MAP_DECOR_COUNT; i++)
         DrawMapBox(i < MAP_BOX_COUNT ? &MAP_BOXES[i] : &MAP_DECOR[i - MAP_BOX_COUNT]);
+    BatchSetMaterial(MAT_FLAT);   // l'enseigne et les personnages : couleur seule
     // Enseigne reprise du premier jeu : un poussin géant tourne au bout d'un
     // mât planté sur le bloc central, repère visible de toute l'arène.
     // Matrice : échelle x6, rotation autour de Y, puis montée en haut du mât.
@@ -1200,9 +1330,10 @@ static void DrawPlayers(void)
         Vector3 p = display_pos[i];
         Color col = TeamColor(sp->team);
 
-        if (sp->is_bot) DrawZombieChick(p, display_yaw[i], &anim[i], col);
-        else            DrawSoldier(p, display_yaw[i], &anim[i], col,
-                                    sp->weapon[sp->slot < WEAPON_SLOTS ? sp->slot : 0]);
+        bool carries = (snap.bomb_state == BOMB_CARRIED && snap.bomb_carrier == i);
+        if (sp->is_bot == BOT_ZOMBIE) DrawZombieChick(p, display_yaw[i], &anim[i], col);
+        else DrawSoldier(p, display_yaw[i], &anim[i], col,
+                         sp->weapon[sp->slot < WEAPON_SLOTS ? sp->slot : 0], carries);
 
         // Ombre "pastille" du premier jeu : elle se resserre quand il saute
         // et s'étale quand il est couché.
@@ -1212,6 +1343,24 @@ static void DrawPlayers(void)
     for (int i = 0; i < TRACER_MAX; i++) {
         if (tracers[i].active)
             DrawLine3D(tracers[i].from, tracers[i].to, (Color){255, 230, 120, 255});
+    }
+
+    // La bombe au sol : lâchée, ou posée (diode qui clignote de plus en plus vite)
+    if (snap.bomb_state == BOMB_DROPPED || snap.bomb_state == BOMB_PLANTED) {
+        float t = (float)GetTime();
+        float rate = (snap.bomb_state == BOMB_PLANTED) ? 2.0f + 10.0f * (1.0f - snap.bomb_timer / BOMB_TIMER) : 1.5f;
+        float blink = (sinf(t * rate * 2 * PI) > 0.3f) ? 1.0f : 0.1f;
+        DrawBomb(MatrixTranslate(snap.bomb_x, snap.bomb_y, snap.bomb_z), blink, snap.bomb_state == BOMB_PLANTED);
+    }
+    // L'explosion : une boule de feu qui gonfle et s'éteint
+    if (explosion_t > 0.0f) {
+        float k = 1.0f - explosion_t;
+        float r = 2.0f + k * BOMB_RADIUS;
+        unsigned char a = (unsigned char)(200 * explosion_t);
+        Ball(MatrixIdentity(), (Vector3){explosion_pos.x, explosion_pos.y + r * 0.4f, explosion_pos.z},
+             (Vector3){r, r * 0.8f, r}, (Color){255, (unsigned char)(120 + 100 * explosion_t), 40, a});
+        Ball(MatrixIdentity(), (Vector3){explosion_pos.x, explosion_pos.y + r * 0.6f, explosion_pos.z},
+             (Vector3){r * 0.6f, r * 0.5f, r * 0.6f}, (Color){255, 240, 180, a});
     }
 }
 
@@ -1425,6 +1574,52 @@ static void DrawHUD(void)
         DrawText(weapon_msg, UIW / 2 - MeasureText(weapon_msg, 20) / 2, 90, 20,
                  Fade((Color){255, 200, 90, 255}, weapon_msg_t > 1.0f ? 1.0f : weapon_msg_t));
 
+    // --- La bombe : ce qu'il faut savoir, et ce qu'il faut faire ---
+    if (me && me->active && snap.round_phase == ROUND_PLAY) {
+        const Color AMBER = {255, 200, 90, 255};
+        const char *key = TouchUsed() ? "BOMBE" : "E";
+        int y0 = 110;
+        if (snap.bomb_state == BOMB_CARRIED && snap.bomb_carrier == my_id && me->alive) {
+            DrawText("Vous portez la bombe", UIW / 2 - MeasureText("Vous portez la bombe", 20) / 2, y0, 20, AMBER);
+            // Le site le plus proche, et sa distance
+            int best = 0; float bd = 1e9f;
+            for (int i = 0; i < BOMB_SITE_COUNT; i++) {
+                float cx = (BOMB_SITES[i].min.x + BOMB_SITES[i].max.x) / 2, cz = (BOMB_SITES[i].min.z + BOMB_SITES[i].max.z) / 2;
+                float d = sqrtf((cx - my_sim.pos.x) * (cx - my_sim.pos.x) + (cz - my_sim.pos.z) * (cz - my_sim.pos.z));
+                if (d < bd) { bd = d; best = i; }
+            }
+            if (BombSiteAt(my_sim.pos) >= 0)
+                snprintf(buf, sizeof(buf), "Site %c : maintenez %s, immobile, pour la poser", 'A' + BombSiteAt(my_sim.pos), key);
+            else
+                snprintf(buf, sizeof(buf), "Site %c à %.0f m", 'A' + best, bd);
+            DrawText(buf, UIW / 2 - MeasureText(buf, 16) / 2, y0 + 24, 16, LIGHTGRAY);
+        } else if (snap.bomb_state == BOMB_DROPPED && me->team == BOMB_TEAM) {
+            DrawText("La bombe est au sol", UIW / 2 - MeasureText("La bombe est au sol", 18) / 2, y0, 18, AMBER);
+        } else if (snap.bomb_state == BOMB_PLANTED) {
+            snprintf(buf, sizeof(buf), "BOMBE POSÉE (site %c) : %.0f s", 'A' + snap.bomb_site, snap.bomb_timer);
+            Color c = (snap.bomb_timer < 10.0f) ? RED : AMBER;
+            DrawText(buf, UIW / 2 - MeasureText(buf, 22) / 2, y0, 22, c);
+            if (me->team != BOMB_TEAM && me->alive) {
+                float dx = snap.bomb_x - my_sim.pos.x, dz = snap.bomb_z - my_sim.pos.z;
+                float d = sqrtf(dx * dx + dz * dz);
+                if (d <= BOMB_USE_RANGE) snprintf(buf, sizeof(buf), "Maintenez %s, immobile, pour désamorcer (%.0f s)", key, BOMB_DEFUSE_TIME);
+                else snprintf(buf, sizeof(buf), "La bombe est à %.0f m", d);
+                DrawText(buf, UIW / 2 - MeasureText(buf, 16) / 2, y0 + 26, 16, LIGHTGRAY);
+            }
+        }
+        // Barre de progression : pose ou désamorçage en cours (par qui que ce soit)
+        if (snap.bomb_actor != 255 && snap.bomb_progress > 0.0f) {
+            const char *what = (snap.bomb_state == BOMB_PLANTED) ? "désamorçage" : "pose de la bombe";
+            snprintf(buf, sizeof(buf), "%s : %s", PlayerName(snap.bomb_actor), what);
+            DrawText(buf, UIW / 2 - MeasureText(buf, 16) / 2, y0 + 50, 16, RAYWHITE);
+            DrawRectangle(UIW / 2 - 100, y0 + 72, 200, 10, Fade(BLACK, 0.5f));
+            DrawRectangle(UIW / 2 - 100, y0 + 72, (int)(200 * snap.bomb_progress), 10, AMBER);
+        }
+    }
+    // Flash de l'explosion
+    if (explosion_t > 0.7f)
+        DrawRectangle(0, 0, UIW, UIH, Fade(WHITE, (explosion_t - 0.7f) / 0.3f * 0.8f));
+
     DrawCrosshair();
 
     // --- Voile rouge quand on vient d'être touché ---
@@ -1461,6 +1656,11 @@ static void DrawHUD(void)
             snprintf(buf, sizeof(buf), "MANCHE %d : NULLE", snap.round);
         }
         DrawText(buf, UIW / 2 - MeasureText(buf, 36) / 2, UIH / 2 - 30, 36, c);
+        const char *why = (round_end_reason == RE_EXPLODED) ? "La bombe a explosé"
+                        : (round_end_reason == RE_DEFUSED)  ? "Bombe désamorcée"
+                        : (round_end_reason == RE_TIME)     ? "Temps écoulé"
+                        : (round_end_reason == RE_DRAW)     ? "" : "Équipe éliminée";
+        if (why[0]) DrawText(why, UIW / 2 - MeasureText(why, 20) / 2, UIH / 2 + 46, 20, LIGHTGRAY);
         snprintf(buf, sizeof(buf), "manche suivante dans %d s", (int)(snap.round_time + 0.999f));
         DrawText(buf, UIW / 2 - MeasureText(buf, 20) / 2, UIH / 2 + 20, 20, LIGHTGRAY);
     } else if (!snap.match_over && snap.round_phase == ROUND_WAIT) {
@@ -1511,6 +1711,7 @@ static void DrawHUD(void)
 static void ApplyOptions(void)
 {
     TouchSetSensitivity(options.touch_sens);
+    SoundSetVolume(options.volume);
 #if !MOBILE_UI
     if (options.fullscreen != IsWindowFullscreen()) ToggleFullscreen();
 #endif
@@ -1523,6 +1724,7 @@ static MenuAction MenuDrawFrame(MenuScreen *screen, bool in_game, const char *st
 {
     UiBegin(ui_scale);
     MenuSetScreen(ui_w, ui_h, MOBILE_UI);
+    if (UiReleased()) SoundPlay(SND_CLICK, 0.5f, 1.0f);
     BeginMode2D(UiCamera());
     MenuAction a = MenuFrame(screen, in_game, status);
     EndMode2D();
@@ -1653,6 +1855,7 @@ int main(int argc, char **argv)
     SetExitKey(KEY_NULL);            // Échap ouvre le menu, il ne quitte plus
 #endif
     UiUpdate();
+    SoundInit();       // synthétise les sons (muet sans carte son)
     ApplyOptions();
 
     if (!connected && !MainMenuLoop()) {
@@ -1666,6 +1869,7 @@ int main(int argc, char **argv)
     SendLoadout();
 
     ModelsInit();   // crée les maillages des personnages (après InitWindow)
+    TexturesInit(); // génère les textures de la carte et les donne au lot
     // Un état d'animation par joueur, décalé par son numéro de slot : deux
     // poussins ne clignent pas des yeux au même instant et ne s'ébrouent
     // pas ensemble.
@@ -1713,6 +1917,7 @@ int main(int argc, char **argv)
         UpdateViewEffects(dt);              // recul, bloom, minuteurs...
         InterpolateOthers(dt);              // lissage des autres joueurs
         UpdatePlayerCamera(&cam, dt, &fov_current);
+        SoundSetListener(cam.position, my_yaw);
 
         // Envoi périodique de nos entrées au serveur (vide = battement de cœur)
         if (GetTime() - last_state_send > 1.0 / CLIENT_SEND_HZ) {
@@ -1722,6 +1927,9 @@ int main(int argc, char **argv)
 
         BeginDrawing();
         ClearBackground((Color){135, 170, 200, 255});   // ciel
+        // Ciel en dégradé : bleu profond au zénith, pâle et chaud à l'horizon
+        DrawRectangleGradientV(0, 0, GetScreenWidth(), GetScreenHeight(),
+                               (Color){86, 134, 196, 255}, (Color){208, 214, 222, 255});
 
         BeginMode3D(cam);       // 1) la scène : map + joueurs + traçantes
         BatchBegin();           //    toutes les primitives des personnages et de
@@ -1774,7 +1982,9 @@ int main(int argc, char **argv)
     }
 
     NetSendDisconnect();
+    TexturesClose();
     ModelsClose();     // libère les maillages (avant CloseWindow)
+    SoundClose();
     CloseWindow();
     SocketClose(sock_fd);
     PlatformNetShutdown();

@@ -253,9 +253,10 @@ jobs:
           | `EMATournament-linux-x64.tar.gz` | `client`, `server`, `bot` |
           | `EMATournament-android.apk` | le jeu au doigt (Android 7.0+, arm64 et x86_64) |
 
-          **Pour jouer** : lancez `server` sur une machine, puis
-          `client <adresse-du-serveur> <pseudo>` sur chaque poste.
-          Sur Android, l'adresse du serveur se tape sur l'ecran d'accueil.
+          **Pour jouer** : lancez `server` sur une machine, puis `client`
+          sur chaque poste (menu d'accueil : adresse du serveur, pseudo,
+          armes, options). Seul ? `bot <adresse> <nom> soldat 2` ajoute un
+          adversaire arme ; `bot <adresse> <nom>` un poussin zombie.
 
           Le deploiement d'un serveur dedie (Linux, systemd, pare-feu,
           Cloudflare) est decrit dans le README.

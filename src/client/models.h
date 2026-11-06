@@ -44,6 +44,13 @@ void ModelsClose(void);   // les libère (avant CloseWindow)
 void BatchBegin(void);
 void BatchEnd(void);
 
+// Matériaux du lot. MAT_FLAT : couleur seule (personnages, armes). Les
+// autres portent une texture (voir textures.c) projetée sur les faces :
+// la carte s'en sert, avec BatchSetMaterial avant chaque primitive.
+enum { MAT_FLAT = 0, MAT_SAND, MAT_WALL, MAT_WOOD, MAT_STONE, MAT_METAL, MAT_CLOTH, MAT_ROOF, MAT_COUNT };
+void BatchSetMaterial(int mat);                              // pour les primitives qui suivent
+void BatchSetTexture(int mat, Texture2D tex, float scale);   // scale = mètres par répétition
+
 //----------------------------------------------------------------------------------
 // Primitives (mêmes signatures que render.h du premier jeu)
 //----------------------------------------------------------------------------------
@@ -127,7 +134,12 @@ void CharAnimLookAt(CharAnim *a, Vector3 self, float yaw, Vector3 target, bool h
 // Le soldat-mercenaire : les JOUEURS humains (treillis olive, visage peint
 // en vert). weapon = WeaponId de l'arme qu'il tient (voir weapons.h) ;
 // sans arme valide, il marche bras tendus comme un zombie.
-void DrawSoldier(Vector3 pos, float yaw, const CharAnim *a, Color team_color, int weapon);
+void DrawSoldier(Vector3 pos, float yaw, const CharAnim *a, Color team_color, int weapon, bool has_bomb);
+
+// La bombe : une mallette sombre avec sa diode rouge (blink = 0..1 :
+// intensité de la diode) et, posée, son antenne. Repère : origine au sol
+// sous la mallette.
+void DrawBomb(Matrix parent, float blink, bool planted);
 
 // Le poussin zombie : les BOTS (poussin humanoïde d'1m60 ensanglanté).
 void DrawZombieChick(Vector3 pos, float yaw, const CharAnim *a, Color team_color);
